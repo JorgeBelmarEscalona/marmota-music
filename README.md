@@ -18,9 +18,11 @@ letras sincronizadas y controles completos. Suena con **mpv** + **yt-dlp**
 | Volumen | arrastrar la barra, rueda del ratón, o `↑` / `↓` |
 | Encoger a la píldora mini | clic en el chevron, `Esc` |
 | Letras / biblioteca / buscar / cola | pestañas de la derecha |
-| Ver el vídeo de la canción | botón ▶▭ junto a *Guardar* |
+| Ver el videoclip dentro del notch | botón ▶▭ junto a *Guardar*, o `v` |
 | Guardar en la biblioteca | botón *Guardar* |
 | Crear lista | Biblioteca → *Nueva lista* |
+| Importar tus listas de YouTube Music | Biblioteca → *Importar de YouTube Music* (usa la sesión del navegador; se configura en `~/.config/marmota-music/config.json`, clave `cookies_browser`) |
+| Reproducir a continuación / quitar de la cola | botones que aparecen al pasar el ratón por una fila |
 
 La píldora mini muestra la línea actual de la letra y la siguiente, además de
 los controles y una línea de progreso en el borde superior.
@@ -35,9 +37,9 @@ altura lógica: 1040×612 en una pantalla 1440p, 832×490 en el panel del portá
 | --- | --- |
 | Ventana | GTK4 + `gtk4-layer-shell` (capa overlay, anclada abajo) |
 | Dibujo | Cairo + Pango, todo pintado a mano (vidrio, iconos, texto) |
-| Audio | mpv con IPC JSON por socket Unix (`--input-ipc-server`) |
-| Búsqueda / metadatos | `yt-dlp --flat-playlist -J "ytsearchN:…"` |
-| Letras | LRCLIB (`/api/get`, fallback `/api/search`), cacheadas en SQLite |
+| Audio y vídeo | libmpv embebido (render por software al notch) con IPC JSON por socket |
+| Búsqueda / inicio / álbumes / listas / radio | API InnerTube de YouTube Music (`src/ytm.rs`); yt-dlp como respaldo y para listas privadas |
+| Letras | LRCLIB (exacta y búsqueda) y NetEase de respaldo; solo se cachean las sincronizadas |
 | Portadas | descargadas y cacheadas en `~/.cache/marmota-music/art/` |
 | Biblioteca / listas | SQLite (`~/.local/share/marmota-music/marmota-music.db`) |
 | Control externo | socket `$XDG_RUNTIME_DIR/marmota-music.sock` + CLI |

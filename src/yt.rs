@@ -149,9 +149,12 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Track>> {
     Ok(tracks)
 }
 
-#[allow(dead_code)]
+/// Songs of a (possibly private) playlist, read with the browser session.
 pub fn playlist(url: &str) -> Result<Vec<Track>> {
+    let browser = crate::paths::cookies_browser();
     let value = run_ytdlp(&[
+        "--cookies-from-browser",
+        &browser,
         "--flat-playlist",
         "-J",
         "--no-warnings",
@@ -206,4 +209,38 @@ pub fn download_cover(id: &str, url: &str) -> Result<std::path::PathBuf> {
         }
     }
     Err(anyhow!("sin portada"))
+}
+
+/// The user's own playlists on YouTube / YouTube Music: (playlist id, title).
+/// "Liked music" is always included first.
+pub fn account_playlists() -> Result<Vec<(String, String)>> {
+    let browser = crate::paths::cookies_browser();
+    let value = run_ytdlp(&[
+        "--cookies-from-browser",
+        &browser,
+        "--flat-playlist",
+        "-J",
+        "--no-warnings",
+        "--socket-timeout",
+        "15",
+        "https://www.youtube.com/feed/playlists",
+    ])?;
+    let mut out = vec![("LM".to_string(), "Me gusta".to_string())];
+    if let Some(entries) = value.get("entries").and_then(|e| e.as_array()) {
+        for e in entries {
+            let Some(id) = e.get("id").and_then(|i| i.as_str()) else { continue };
+            let title = e.get("title").and_then(|t| t.as_str()).unwrap_or("Lista");
+            if id == "LM" || id == "LL" || out.iter().any(|(x, _)| x == id) {
+                continue;
+            }
+            out.push((id.to_string(), title.to_string()));
+        }
+    }
+    if out.len() == 1 {
+        return Err(anyhow!(
+            "no se encontraron listas: inicia sesión en YouTube en tu navegador \
+             (o cambia cookies_browser en ~/.config/marmota-music/config.json)"
+        ));
+    }
+    Ok(out)
 }

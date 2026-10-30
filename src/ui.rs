@@ -1,5 +1,6 @@
 use gtk4 as gtk;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -11,11 +12,11 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use crate::db::Db;
 use crate::lyrics;
 use crate::model::*;
-use crate::mpv::Mpv;
+use crate::mpv::{self, Mpv};
 use crate::paths;
 use crate::spotify::{self, Cmd as SpotifyCmd, Spotify};
 use crate::theme::{self, Rgb};
-use crate::yt;
+use crate::{yt, ytm};
 
 pub const COLLAPSED_W: f64 = 664.0;
 pub const COLLAPSED_H: f64 = 74.0;
@@ -23,12 +24,53 @@ pub const EXPANDED_W: f64 = 1040.0;
 pub const EXPANDED_H: f64 = 612.0;
 const ANIM_MS: f64 = 320.0;
 
+pub const TRACK_ROW: f64 = 50.0;
+pub const COLL_ROW: f64 = 56.0;
+pub const HEADER_ROW: f64 = 30.0;
+pub const DETAIL_HEAD: f64 = 112.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Lyrics,
     Library,
     Search,
     Queue,
+}
+
+/// Which list a track row points into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum List {
+    Results,
+    Saved,
+    History,
+    Detail,
+    Home,
+    Queue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowItem {
+    Header(&'static str),
+    Message(&'static str),
+    Track(List, usize),
+    /// "Play next" button on a track row.
+    Enqueue(List, usize),
+    Unsave(usize),
+    Dequeue(usize),
+    RemoveFromPlaylist(usize),
+    SearchColl(usize),
+    HomeColl(usize),
+    Mix(usize),
+    Playlist(usize),
+    AddTo(i64),
+    DeletePlaylist(i64),
+    NewPlaylist,
+    Import,
+    Back,
+    DetailPlay,
+    DetailShuffle,
+    DetailSave,
+    Lyric(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -44,27 +86,9 @@ pub enum Hit {
     Video,
     Spotify,
     Tab(Tab),
-    Playlist(usize),
-    AddTo(i64),
-    Track(usize),
-    Result(usize),
-    QueueTrack(usize),
-    NewPlaylist,
     SaveCurrent,
-    Lyric(usize),
     Close,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RowItem {
-    Header(&'static str),
-    Playlist(usize),
-    AddTo(i64),
-    Track(usize),
-    Result(usize),
-    QueueTrack(usize),
-    NewPlaylist,
-    Lyric(usize),
+    Row(RowItem),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -89,50 +113,33 @@ pub struct Layout {
     pub content: Rect,
     pub entry: Rect,
     pub save: Rect,
-    pub new_playlist: Rect,
     pub close: Rect,
+    /// Where the embedded video is painted (empty when not showing video).
+    pub screen: Rect,
+    /// Lyrics area: the whole pane, or what is left under the video.
+    pub lyrics: Rect,
 }
 
 impl Layout {
     pub fn hit(&self, x: f64, y: f64) -> Option<Hit> {
-        if self.chevron.contains(x, y) {
-            return Some(Hit::Chevron);
-        }
-        if self.play.contains(x, y) {
-            return Some(Hit::Play);
-        }
-        if self.prev.contains(x, y) {
-            return Some(Hit::Prev);
-        }
-        if self.next.contains(x, y) {
-            return Some(Hit::Next);
-        }
-        if self.shuffle.contains(x, y) {
-            return Some(Hit::Shuffle);
-        }
-        if self.repeat.contains(x, y) {
-            return Some(Hit::Repeat);
-        }
-        if self.seek.contains(x, y) {
-            return Some(Hit::Seek);
-        }
-        if self.volume.contains(x, y) {
-            return Some(Hit::Volume);
-        }
-        if self.video.contains(x, y) {
-            return Some(Hit::Video);
-        }
-        if self.spotify.contains(x, y) {
-            return Some(Hit::Spotify);
-        }
-        if self.close.contains(x, y) {
-            return Some(Hit::Close);
-        }
-        if self.save.contains(x, y) {
-            return Some(Hit::SaveCurrent);
-        }
-        if self.new_playlist.contains(x, y) {
-            return Some(Hit::NewPlaylist);
+        let fixed = [
+            (self.chevron, Hit::Chevron),
+            (self.play, Hit::Play),
+            (self.prev, Hit::Prev),
+            (self.next, Hit::Next),
+            (self.shuffle, Hit::Shuffle),
+            (self.repeat, Hit::Repeat),
+            (self.seek, Hit::Seek),
+            (self.volume, Hit::Volume),
+            (self.video, Hit::Video),
+            (self.spotify, Hit::Spotify),
+            (self.close, Hit::Close),
+            (self.save, Hit::SaveCurrent),
+        ];
+        for (r, h) in fixed {
+            if r.contains(x, y) {
+                return Some(h);
+            }
         }
         if !self.collapsed {
             for (i, r) in self.tabs.iter().enumerate() {
@@ -160,14 +167,8 @@ pub enum Repeat {
 impl RowItem {
     fn hit(self) -> Option<Hit> {
         match self {
-            RowItem::Playlist(i) => Some(Hit::Playlist(i)),
-            RowItem::AddTo(id) => Some(Hit::AddTo(id)),
-            RowItem::Track(i) => Some(Hit::Track(i)),
-            RowItem::Result(i) => Some(Hit::Result(i)),
-            RowItem::QueueTrack(i) => Some(Hit::QueueTrack(i)),
-            RowItem::NewPlaylist => Some(Hit::NewPlaylist),
-            RowItem::Lyric(i) => Some(Hit::Lyric(i)),
-            RowItem::Header(_) => None,
+            RowItem::Header(_) | RowItem::Message(_) => None,
+            other => Some(Hit::Row(other)),
         }
     }
 }
@@ -185,11 +186,27 @@ pub enum Drag {
     Volume,
 }
 
+/// An opened album / playlist / mix.
+#[derive(Clone, Debug)]
+pub struct Detail {
+    pub key: String,
+    pub title: String,
+    pub subtitle: String,
+    pub art: String,
+    pub kind: CollKind,
+    pub tracks: Vec<Track>,
+    pub loading: bool,
+    /// Local playlist id when it lives in the library.
+    pub local: Option<i64>,
+    /// YouTube Music browse id, if any.
+    pub remote: String,
+    pub tab: Tab,
+}
+
 pub struct App {
     pub app: gtk::Application,
     pub window: gtk::Window,
     pub area: gtk::DrawingArea,
-    pub fixed: gtk::Fixed,
     pub entry: gtk::Entry,
 
     pub playback: Arc<Mutex<Playback>>,
@@ -205,9 +222,17 @@ pub struct App {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub volume: f64,
+    pub current_saved: bool,
+
     pub video: bool,
     pub video_at: Instant,
     pub has_video: bool,
+    pub video_serial: u64,
+    pub video_surface: Option<cairo::ImageSurface>,
+
+    pub radio_seed: String,
+    pub radio_loading: bool,
+    pub radio_waiting: bool,
 
     pub playing: bool,
     pub pos: f64,
@@ -240,17 +265,27 @@ pub struct App {
     pub lyric_scroll: f64,
     pub list_scroll: f64,
     pub lyric_idx: usize,
-    #[allow(dead_code)]
-    pub lyric_moved: Instant,
 
     pub library: Vec<Track>,
+    pub history: Vec<Track>,
     pub playlists: Vec<Playlist>,
-    #[allow(dead_code)]
-    pub queued: Vec<(usize, Track)>, // (1-based position, track) mirror for drawing
+    pub mixes: Vec<Collection>,
+    pub detail: Option<Detail>,
+    pub importing: bool,
+    pub confirm_delete: Option<(i64, Instant)>,
 
     pub search_query: String,
+    pub searched: String,
+    pub search_edit: Option<Instant>,
     pub results: Vec<Track>,
+    pub colls: Vec<Collection>,
     pub searching: bool,
+    pub home_colls: Vec<Collection>,
+    pub home_tracks: Vec<Track>,
+    pub home_state: u8, // 0 idle, 1 loading, 2 ready, 3 failed
+
+    pub thumbs: RefCell<HashMap<String, Option<cairo::ImageSurface>>>,
+    pub thumb_tx: Sender<String>,
 
     pub accent: Rgb,
     pub cover: Option<cairo::ImageSurface>,
@@ -298,12 +333,52 @@ pub fn run(
     Ok(())
 }
 
+/// A few threads that fetch list thumbnails into the cache.
+fn thumb_workers(events: Sender<Event>) -> Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..4 {
+        let rx = rx.clone();
+        let events = events.clone();
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .ok();
+            loop {
+                let url = {
+                    let Ok(guard) = rx.lock() else { return };
+                    match guard.recv() {
+                        Ok(u) => u,
+                        Err(_) => return,
+                    }
+                };
+                let path = paths::thumb_path(&url);
+                if !path.exists() {
+                    let Some(c) = &client else { continue };
+                    let Ok(resp) = c.get(&url).send() else { continue };
+                    if !resp.status().is_success() {
+                        continue;
+                    }
+                    let Ok(bytes) = resp.bytes() else { continue };
+                    if std::fs::write(&path, &bytes).is_err() {
+                        continue;
+                    }
+                }
+                let _ = events.send(Event::ThumbDone(url, path));
+            }
+        });
+    }
+    tx
+}
+
 fn build(
     app: &gtk::Application,
     rx: Receiver<Event>,
     tx: Sender<Event>,
     shared: Arc<Mutex<Snapshot>>,
-) -> anyhow::Result<()> {    paths::ensure_dirs();
+) -> anyhow::Result<()> {
+    paths::ensure_dirs();
 
     let css = gtk::CssProvider::new();
     css.load_from_data(
@@ -361,33 +436,29 @@ fn build(
     area.set_hexpand(true);
     area.set_vexpand(true);
 
-    let fixed = gtk::Fixed::new();
-    fixed.set_hexpand(true);
-    fixed.set_vexpand(true);
-    fixed.set_can_target(false);
-
+    // The entry is a direct overlay child (not inside a full-size container)
+    // so it receives its own clicks while the drawing area keeps the rest.
     let entry = gtk::Entry::new();
     entry.add_css_class("mm-entry");
     entry.set_visible(false);
+    entry.set_halign(gtk::Align::Start);
+    entry.set_valign(gtk::Align::Start);
     entry.set_size_request(430, 38);
-    fixed.put(&entry, 430.0, 36.0);
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&area));
-    overlay.add_overlay(&fixed);
+    overlay.add_overlay(&entry);
     window.set_child(Some(&overlay));
 
     let playback = Arc::new(Mutex::new(Playback::default()));
     let mpv = Mpv::new(playback.clone(), tx.clone());
     let db = Db::open()?;
-    let library = db.library();
-    let playlists = db.playlists();
+    let thumb_tx = thumb_workers(tx.clone());
 
     let mut state = App {
         app: app.clone(),
         window: window.clone(),
         area: area.clone(),
-        fixed: fixed.clone(),
         entry: entry.clone(),
         playback,
         shared,
@@ -396,17 +467,22 @@ fn build(
         rx,
         db,
         track: None,
-        queued: Vec::new(),
         queue: Vec::new(),
         index: 0,
         shuffle: false,
         repeat: Repeat::Off,
         volume: 70.0,
+        current_saved: false,
         drawn_pos: -1.0,
         frame: 0,
         video: false,
         video_at: Instant::now(),
         has_video: false,
+        video_serial: 0,
+        video_surface: None,
+        radio_seed: String::new(),
+        radio_loading: false,
+        radio_waiting: false,
         playing: false,
         pos: 0.0,
         dur: 0.0,
@@ -431,12 +507,24 @@ fn build(
         lyric_scroll: 0.0,
         list_scroll: 0.0,
         lyric_idx: 0,
-        lyric_moved: Instant::now(),
-        library,
-        playlists,
+        library: Vec::new(),
+        history: Vec::new(),
+        playlists: Vec::new(),
+        mixes: Vec::new(),
+        detail: None,
+        importing: false,
+        confirm_delete: None,
         search_query: String::new(),
+        searched: String::new(),
+        search_edit: None,
         results: Vec::new(),
+        colls: Vec::new(),
         searching: false,
+        home_colls: Vec::new(),
+        home_tracks: Vec::new(),
+        home_state: 0,
+        thumbs: RefCell::new(HashMap::new()),
+        thumb_tx,
         accent: theme::ACCENT_FALLBACK,
         cover: None,
         cover_key: String::new(),
@@ -455,8 +543,7 @@ fn build(
         dirty: true,
         last_pos: -1.0,
     };
-    state.width = COLLAPSED_W;
-    state.height = COLLAPSED_H;
+    state.refresh_library();
 
     let app_cell = Rc::new(RefCell::new(state));
 
@@ -501,12 +588,13 @@ fn build(
         scroll.connect_scroll(move |_, _dx, dy| {
             let mut s = a.borrow_mut();
             let l = s.layout();
-            if s.volume_rect().contains(s.mouse.0, s.mouse.1) {
+            if l.volume.contains(s.mouse.0, s.mouse.1) {
                 let target = s.volume - dy * 4.0;
                 s.set_volume(target);
             } else if l.content.contains(s.mouse.0, s.mouse.1) {
                 if s.tab == Tab::Lyrics {
-                    s.lyric_scroll -= dy * 40.0;
+                    s.lyric_scroll += dy * 40.0;
+                    s.lyric_manual = Instant::now();
                     s.dirty = true;
                 } else {
                     s.scroll_list(dy);
@@ -521,18 +609,33 @@ fn build(
     {
         let a = app_cell.clone();
         let keys = gtk::EventControllerKey::new();
-        keys.connect_key_pressed(move |_, key, _code, mods| {
-            let mut s = a.borrow_mut();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed(move |_, key, _code, _mods| {
+            let Ok(mut s) = a.try_borrow_mut() else {
+                return glib::Propagation::Proceed;
+            };
             if s.entry.has_focus() {
                 if key == gtk::gdk::Key::Escape {
-                    s.close_entry();
+                    if s.entry_mode == EntryMode::Search && !s.search_query.is_empty() {
+                        s.search_query.clear();
+                        s.entry.set_text("");
+                        s.results.clear();
+                        s.colls.clear();
+                        s.searched.clear();
+                        s.dirty = true;
+                    } else {
+                        s.close_entry();
+                        s.area.grab_focus();
+                    }
                     return glib::Propagation::Stop;
                 }
                 return glib::Propagation::Proceed;
             }
             match key {
                 gtk::gdk::Key::Escape => {
-                    if s.expanded {
+                    if s.detail.as_ref().is_some_and(|d| d.tab == s.tab) {
+                        s.close_detail();
+                    } else if s.expanded {
                         s.collapse();
                     } else {
                         s.hide();
@@ -559,9 +662,13 @@ fn build(
                     s.adjust_volume(-4.0);
                     glib::Propagation::Stop
                 }
-                k if k == gtk::gdk::Key::_1 && mods.contains(gtk::gdk::ModifierType::ALT_MASK) => {
-                    s.tab = Tab::Lyrics;
-                    s.dirty = true;
+                gtk::gdk::Key::slash | gtk::gdk::Key::f => {
+                    s.open_search();
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::v => {
+                    let on = !s.video;
+                    s.set_video(on);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -578,7 +685,10 @@ fn build(
             // so never hard-borrow here.
             if let Some(a) = weak.upgrade() {
                 if let Ok(mut s) = a.try_borrow_mut() {
-                    s.search_query = e.text().to_string();
+                    if s.entry_mode == EntryMode::Search {
+                        s.search_query = e.text().to_string();
+                        s.search_edit = Some(Instant::now());
+                    }
                 }
             }
         });
@@ -589,7 +699,11 @@ fn build(
             if let Some(a) = weak.upgrade() {
                 let Ok(mut s) = a.try_borrow_mut() else { return };
                 match s.entry_mode {
-                    EntryMode::Search => s.run_search(),
+                    EntryMode::Search => {
+                        s.search_edit = None;
+                        s.searched.clear();
+                        s.run_search();
+                    }
                     EntryMode::NewPlaylist => s.create_playlist_from_entry(),
                     EntryMode::Hidden => {}
                 }
@@ -601,8 +715,9 @@ fn build(
     {
         let a = app_cell.clone();
         glib::timeout_add_local(Duration::from_millis(16), move || {
-            let mut s = a.borrow_mut();
-            s.tick();
+            if let Ok(mut s) = a.try_borrow_mut() {
+                s.tick();
+            }
             glib::ControlFlow::Continue
         });
     }
@@ -614,10 +729,6 @@ fn build(
 
 impl App {
     // ------------------------------------------------------------- geometry
-    pub fn volume_rect(&self) -> Rect {
-        self.layout().volume
-    }
-
     pub fn layout(&self) -> Layout {
         if self.anim < 0.55 {
             self.collapsed_layout()
@@ -639,6 +750,10 @@ impl App {
         l.next = Rect::new(532.0, 21.0, 34.0, 34.0);
         l.chevron = Rect::new(w - 54.0, 19.0, 42.0, 38.0);
         l
+    }
+
+    pub fn showing_video(&self) -> bool {
+        self.video && self.has_video && self.video_surface.is_some()
     }
 
     pub(crate) fn expanded_layout(&self) -> Layout {
@@ -665,124 +780,235 @@ impl App {
             Rect::new(664.0, 28.0, 100.0, 36.0),
             Rect::new(776.0, 28.0, 84.0, 36.0),
         ];
-        l.entry = Rect::new(430.0, 84.0, 470.0, 38.0);
+        l.entry = Rect::new(430.0, 84.0, w - 458.0, 38.0);
         l.content = Rect::new(430.0, 84.0, w - 458.0, h - 112.0);
-        if self.tab == Tab::Search {
+        let entry_visible = self.entry_mode != EntryMode::Hidden
+            && !(self.tab == Tab::Search && self.detail_here());
+        if entry_visible {
             l.content = Rect::new(430.0, 134.0, w - 458.0, h - 162.0);
-        } else if self.entry_mode == EntryMode::NewPlaylist {
-            l.content = Rect::new(430.0, 134.0, w - 458.0, h - 162.0);
+        }
+        l.lyrics = l.content;
+        if self.tab == Tab::Lyrics && self.showing_video() {
+            let vh = (l.content.w * 9.0 / 16.0).round();
+            l.screen = Rect::new(l.content.x, l.content.y, l.content.w, vh);
+            l.lyrics = Rect::new(
+                l.content.x,
+                l.content.y + vh + 8.0,
+                l.content.w,
+                (l.content.h - vh - 8.0).max(0.0),
+            );
         }
         l
     }
 
+    /// Is the opened album/playlist showing in the current tab?
+    pub fn detail_here(&self) -> bool {
+        self.detail.as_ref().is_some_and(|d| d.tab == self.tab)
+    }
+
     // ---------------------------------------------------------------- rows
+    /// Every row of the current tab, positioned with the scroll offset
+    /// applied. Action buttons come before the row they sit on, so hit
+    /// testing finds them first.
     pub fn rows(&self, content: Rect) -> Vec<(Rect, RowItem)> {
         let mut out: Vec<(Rect, RowItem)> = Vec::new();
-        let off = if self.tab == Tab::Lyrics { 0.0 } else { self.list_scroll };
-        match self.tab {
-            Tab::Lyrics => {
-                if self.lyrics.is_empty() {
-                    return out;
+        if self.tab == Tab::Lyrics {
+            let lr = self.layout().lyrics;
+            let rowh = 46.0;
+            for i in 0..self.lyrics.len() {
+                let y = lr.y + 12.0 + i as f64 * rowh - self.lyric_scroll;
+                if y + rowh < lr.y || y > lr.y + lr.h {
+                    continue;
                 }
-                let rowh = 46.0;
-                for (i, _line) in self.lyrics.iter().enumerate() {
-                    let y = content.y + 12.0 + i as f64 * rowh - self.lyric_scroll;
-                    if y + rowh < content.y || y > content.y + content.h {
-                        continue;
-                    }
-                    out.push((Rect::new(content.x, y, content.w, rowh), RowItem::Lyric(i)));
-                }
+                out.push((Rect::new(lr.x, y, lr.w, rowh), RowItem::Lyric(i)));
             }
-            Tab::Library => {
-                let mut y = content.y + 4.0 - off;
-                out.push((
-                    Rect::new(content.x, y, content.w, 22.0),
-                    RowItem::Header("LISTAS"),
-                ));
-                y += 26.0;
-                for (i, p) in self.playlists.iter().enumerate() {
-                    let r = Rect::new(content.x, y, content.w, 40.0);
-                    if r.y + r.h > content.y && r.y < content.y + content.h {
-                    out.push((
-                        Rect::new(r.x + r.w - 38.0, r.y + 5.0, 30.0, 30.0),
-                        RowItem::AddTo(p.id),
-                    ));
-                    out.push((r, RowItem::Playlist(i)));
-                    }
-                    y += 44.0;
+            return out;
+        }
+
+        let x = content.x;
+        let w = content.w;
+        let mut y = content.y + 4.0 - self.list_scroll;
+
+        let header = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, text: &'static str| {
+            out.push((Rect::new(x, *y, w, HEADER_ROW), RowItem::Header(text)));
+            *y += HEADER_ROW;
+        };
+        let message = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, text: &'static str| {
+            out.push((Rect::new(x, *y, w, 44.0), RowItem::Message(text)));
+            *y += 48.0;
+        };
+        // A track row with up to two small action buttons on the right.
+        let track = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, item: RowItem, actions: &[RowItem]| {
+            let r = Rect::new(x, *y, w, TRACK_ROW - 4.0);
+            let mut bx = r.x + r.w - 38.0;
+            for a in actions {
+                out.push((Rect::new(bx, r.y + 7.0, 32.0, 32.0), *a));
+                bx -= 36.0;
+            }
+            out.push((r, item));
+            *y += TRACK_ROW;
+        };
+        let coll = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, item: RowItem, actions: &[RowItem]| {
+            let r = Rect::new(x, *y, w, COLL_ROW - 4.0);
+            let mut bx = r.x + r.w - 38.0;
+            for a in actions {
+                out.push((Rect::new(bx, r.y + 10.0, 32.0, 32.0), *a));
+                bx -= 36.0;
+            }
+            out.push((r, item));
+            *y += COLL_ROW;
+        };
+
+        if let Some(d) = self.detail.as_ref().filter(|d| d.tab == self.tab) {
+            out.push((Rect::new(x, y, 92.0, 28.0), RowItem::Back));
+            let by = y + 72.0;
+            out.push((Rect::new(x + 108.0, by, 118.0, 32.0), RowItem::DetailPlay));
+            out.push((Rect::new(x + 234.0, by, 112.0, 32.0), RowItem::DetailShuffle));
+            if d.local.is_none() && !d.tracks.is_empty() {
+                out.push((Rect::new(x + 354.0, by, 104.0, 32.0), RowItem::DetailSave));
+            }
+            y += DETAIL_HEAD;
+            if d.loading && d.tracks.is_empty() {
+                message(&mut out, &mut y, "Cargando canciones…");
+            } else if d.tracks.is_empty() {
+                message(&mut out, &mut y, "Esta lista está vacía");
+            }
+            let editable = d.local.is_some() && d.remote.is_empty();
+            for i in 0..d.tracks.len() {
+                let mut actions = vec![RowItem::Enqueue(List::Detail, i)];
+                if editable {
+                    actions.push(RowItem::RemoveFromPlaylist(i));
                 }
-                out.push((
-                    Rect::new(content.x, y, content.w, 36.0),
-                    RowItem::NewPlaylist,
-                ));
-                y += 44.0;
-                out.push((
-                    Rect::new(content.x, y, content.w, 22.0),
-                    RowItem::Header("GUARDADAS"),
-                ));
-                y += 26.0;
-                for (i, _t) in self.library.iter().enumerate() {
-                    if y > content.y + content.h {
-                        break;
+                track(&mut out, &mut y, RowItem::Track(List::Detail, i), &actions);
+            }
+            return out;
+        }
+
+        match self.tab {
+            Tab::Lyrics => {}
+            Tab::Library => {
+                let half = (w - 8.0) / 2.0;
+                out.push((Rect::new(x, y, half, 36.0), RowItem::Import));
+                out.push((Rect::new(x + half + 8.0, y, half, 36.0), RowItem::NewPlaylist));
+                y += 46.0;
+                header(&mut out, &mut y, "TUS LISTAS");
+                if self.playlists.is_empty() {
+                    message(&mut out, &mut y, "Importa tus listas de YouTube Music o crea una");
+                }
+                for (i, p) in self.playlists.iter().enumerate() {
+                    coll(&mut out, &mut y, RowItem::Playlist(i), &[RowItem::DeletePlaylist(p.id), RowItem::AddTo(p.id)]);
+                }
+                y += 6.0;
+                header(&mut out, &mut y, "CANCIONES GUARDADAS");
+                if self.library.is_empty() {
+                    message(&mut out, &mut y, "Usa «Guardar» para tener aquí tus canciones");
+                }
+                for i in 0..self.library.len() {
+                    track(&mut out, &mut y, RowItem::Track(List::Saved, i), &[RowItem::Unsave(i), RowItem::Enqueue(List::Saved, i)]);
+                }
+                if !self.history.is_empty() {
+                    y += 6.0;
+                    header(&mut out, &mut y, "ESCUCHADAS HACE POCO");
+                    for i in 0..self.history.len() {
+                        track(&mut out, &mut y, RowItem::Track(List::History, i), &[RowItem::Enqueue(List::History, i)]);
                     }
-                    out.push((
-                        Rect::new(content.x, y, content.w, 46.0),
-                        RowItem::Track(i),
-                    ));
-                    y += 50.0;
                 }
             }
             Tab::Search => {
-                let mut y = content.y + 4.0 - off;
-                if self.searching {
-                    out.push((
-                        Rect::new(content.x, y, content.w, 40.0),
-                        RowItem::Header("Buscando…"),
-                    ));
-                } else if self.results.is_empty() {
-                    let msg = if self.search_query.trim().is_empty() {
-                        "Escribe para buscar en YouTube Music"
-                    } else {
-                        "Sin resultados"
-                    };
-                    out.push((
-                        Rect::new(content.x, y, content.w, 40.0),
-                        RowItem::Header(msg),
-                    ));
-                } else {
-                    for (i, _) in self.results.iter().enumerate() {
-                        if y > content.y + content.h {
-                            break;
+                let has_results = !self.results.is_empty() || !self.colls.is_empty();
+                if self.searching && !has_results {
+                    message(&mut out, &mut y, "Buscando…");
+                } else if has_results && !self.search_query.trim().is_empty() {
+                    let top = self.results.len().min(6);
+                    if top > 0 {
+                        header(&mut out, &mut y, "CANCIONES");
+                        for i in 0..top {
+                            track(&mut out, &mut y, RowItem::Track(List::Results, i), &[RowItem::Enqueue(List::Results, i)]);
                         }
-                        out.push((
-                            Rect::new(content.x, y, content.w, 48.0),
-                            RowItem::Result(i),
-                        ));
-                        y += 52.0;
+                    }
+                    if !self.colls.is_empty() {
+                        y += 6.0;
+                        header(&mut out, &mut y, "ÁLBUMES Y LISTAS");
+                        for i in 0..self.colls.len() {
+                            coll(&mut out, &mut y, RowItem::SearchColl(i), &[]);
+                        }
+                    }
+                    if self.results.len() > top {
+                        y += 6.0;
+                        header(&mut out, &mut y, "MÁS CANCIONES");
+                        for i in top..self.results.len() {
+                            track(&mut out, &mut y, RowItem::Track(List::Results, i), &[RowItem::Enqueue(List::Results, i)]);
+                        }
+                    }
+                } else if !self.searched.is_empty() && !self.searching && self.search_query.trim() == self.searched {
+                    message(&mut out, &mut y, "Sin resultados");
+                } else {
+                    if !self.mixes.is_empty() {
+                        header(&mut out, &mut y, "MIX PARA TI");
+                        for i in 0..self.mixes.len() {
+                            coll(&mut out, &mut y, RowItem::Mix(i), &[]);
+                        }
+                        y += 6.0;
+                    }
+                    match self.home_state {
+                        1 | 0 => message(&mut out, &mut y, "Cargando recomendaciones…"),
+                        3 => message(&mut out, &mut y, "No se pudieron cargar las recomendaciones"),
+                        _ => {
+                            if !self.home_colls.is_empty() {
+                                header(&mut out, &mut y, "LISTAS RECOMENDADAS");
+                                for i in 0..self.home_colls.len() {
+                                    coll(&mut out, &mut y, RowItem::HomeColl(i), &[]);
+                                }
+                                y += 6.0;
+                            }
+                            if !self.home_tracks.is_empty() {
+                                header(&mut out, &mut y, "SELECCIÓN RÁPIDA");
+                                for i in 0..self.home_tracks.len() {
+                                    track(&mut out, &mut y, RowItem::Track(List::Home, i), &[RowItem::Enqueue(List::Home, i)]);
+                                }
+                            }
+                        }
                     }
                 }
             }
             Tab::Queue => {
-                let mut y = content.y + 4.0 - off;
                 if self.queue.is_empty() {
-                    out.push((
-                        Rect::new(content.x, y, content.w, 40.0),
-                        RowItem::Header("Nada en cola"),
-                    ));
+                    message(&mut out, &mut y, "La cola está vacía");
+                    return out;
                 }
-                for (i, _) in self.queue.iter().enumerate() {
-                    if y > content.y + content.h {
-                        break;
+                header(&mut out, &mut y, "SONANDO AHORA");
+                track(&mut out, &mut y, RowItem::Track(List::Queue, self.index), &[]);
+                if self.index + 1 < self.queue.len() {
+                    y += 6.0;
+                    header(&mut out, &mut y, "A CONTINUACIÓN");
+                    for i in self.index + 1..self.queue.len() {
+                        track(&mut out, &mut y, RowItem::Track(List::Queue, i), &[RowItem::Dequeue(i)]);
                     }
-                    out.push((
-                        Rect::new(content.x, y, content.w, 46.0),
-                        RowItem::QueueTrack(i),
-                    ));
-                    y += 50.0;
+                }
+                if self.radio_loading {
+                    message(&mut out, &mut y, "Buscando canciones parecidas…");
+                }
+                if self.index > 0 {
+                    y += 6.0;
+                    header(&mut out, &mut y, "YA SONARON");
+                    for i in 0..self.index {
+                        track(&mut out, &mut y, RowItem::Track(List::Queue, i), &[RowItem::Dequeue(i)]);
+                    }
                 }
             }
         }
         out
+    }
+
+    pub fn list_track(&self, list: List, i: usize) -> Option<&Track> {
+        match list {
+            List::Results => self.results.get(i),
+            List::Saved => self.library.get(i),
+            List::History => self.history.get(i),
+            List::Detail => self.detail.as_ref().and_then(|d| d.tracks.get(i)),
+            List::Home => self.home_tracks.get(i),
+            List::Queue => self.queue.get(i),
+        }
     }
 
     // ------------------------------------------------------------- input
@@ -792,7 +1018,7 @@ impl App {
         self.mouse = (x, y);
         let l = self.layout();
         let mut hit = l.hit(x, y);
-        if hit.is_none() {
+        if hit.is_none() && !l.collapsed && l.content.contains(x, y) {
             for (r, item) in self.rows(l.content) {
                 if r.contains(x, y) {
                     hit = item.hit();
@@ -819,7 +1045,7 @@ impl App {
                 }
                 Drag::Volume => {
                     if l.volume.w > 0.0 {
-                        let f = ((x - l.volume.x) / l.volume.w).clamp(0.0, 1.0);
+                        let f = ((x - l.volume.x - 30.0) / (l.volume.w - 76.0)).clamp(0.0, 1.0);
                         self.set_volume(f * 100.0);
                     }
                 }
@@ -844,13 +1070,15 @@ impl App {
             self.act(h, x, y);
             return;
         }
-        for (r, item) in self.rows(l.content) {
-            if r.contains(x, y) {
-                self.act_row(item);
-                return;
+        if l.content.contains(x, y) {
+            for (r, item) in self.rows(l.content) {
+                if r.contains(x, y) && item.hit().is_some() {
+                    self.act_row(item);
+                    return;
+                }
             }
         }
-        if self.entry_mode != EntryMode::Hidden {
+        if self.entry_mode == EntryMode::NewPlaylist {
             self.close_entry();
         }
     }
@@ -862,7 +1090,7 @@ impl App {
             Hit::Next => self.advance(false),
             Hit::Shuffle => {
                 self.shuffle = !self.shuffle;
-                self.dirty = true;
+                self.set_status(if self.shuffle { "Aleatorio activado" } else { "Aleatorio desactivado" });
             }
             Hit::Repeat => {
                 self.repeat = match self.repeat {
@@ -870,7 +1098,11 @@ impl App {
                     Repeat::All => Repeat::One,
                     Repeat::One => Repeat::Off,
                 };
-                self.dirty = true;
+                self.set_status(match self.repeat {
+                    Repeat::Off => "Repetir desactivado",
+                    Repeat::All => "Repetir la cola",
+                    Repeat::One => "Repetir esta canción",
+                });
             }
             Hit::Chevron => {
                 if self.expanded {
@@ -903,11 +1135,16 @@ impl App {
                 let l = self.layout();
                 self.dragging = Some(Drag::Volume);
                 if l.volume.w > 0.0 {
-                    let f = ((x - l.volume.x) / l.volume.w).clamp(0.0, 1.0);
+                    let f = ((x - l.volume.x - 30.0) / (l.volume.w - 76.0)).clamp(0.0, 1.0);
                     self.set_volume(f * 100.0);
                 }
             }
             Hit::Tab(t) => {
+                if self.tab == t && self.detail_here() {
+                    // Clicking the active tab again goes back to its root.
+                    self.close_detail();
+                    return;
+                }
                 self.tab = t;
                 self.list_scroll = 0.0;
                 if t == Tab::Library {
@@ -922,62 +1159,141 @@ impl App {
             }
             Hit::SaveCurrent => {
                 if let Some(t) = self.track.clone() {
-                    let _ = self.db.save_track(&t);
-                    self.refresh_library();
-                    self.set_status("Guardada en tu biblioteca");
+                    let saved = !self.current_saved;
+                    if self.db.set_saved(&t, saved).is_ok() {
+                        self.current_saved = saved;
+                        self.refresh_library();
+                        self.set_status(if saved {
+                            "Guardada en tu biblioteca"
+                        } else {
+                            "Quitada de tu biblioteca"
+                        });
+                    }
                 }
             }
-            Hit::NewPlaylist => self.new_playlist(),
-            _ => {}
+            Hit::Row(item) => self.act_row(item),
         }
     }
 
     fn act_row(&mut self, item: RowItem) {
         match item {
+            RowItem::Track(list, i) => self.play_from(list, i),
+            RowItem::Enqueue(list, i) => {
+                if let Some(t) = self.list_track(list, i).cloned() {
+                    self.enqueue_next(t);
+                }
+            }
+            RowItem::Dequeue(i) => {
+                if i < self.queue.len() && i != self.index {
+                    self.queue.remove(i);
+                    if i < self.index {
+                        self.index -= 1;
+                    }
+                    self.clamp_scroll();
+                }
+            }
+            RowItem::Unsave(i) => {
+                if let Some(t) = self.library.get(i).cloned() {
+                    let _ = self.db.set_saved(&t, false);
+                    if self.track.as_ref().is_some_and(|c| c.id == t.id) {
+                        self.current_saved = false;
+                    }
+                    self.refresh_library();
+                    self.set_status("Quitada de tu biblioteca");
+                }
+            }
+            RowItem::RemoveFromPlaylist(i) => {
+                let target = self
+                    .detail
+                    .as_ref()
+                    .and_then(|d| Some((d.local?, d.tracks.get(i)?.id.clone())));
+                if let Some((pid, id)) = target {
+                    let _ = self.db.remove_from_playlist(pid, &id);
+                    if let Some(d) = self.detail.as_mut() {
+                        d.tracks.remove(i);
+                    }
+                    self.refresh_library();
+                    self.set_status("Quitada de la lista");
+                }
+            }
+            RowItem::SearchColl(i) => {
+                if let Some(c) = self.colls.get(i).cloned() {
+                    self.open_collection(c);
+                }
+            }
+            RowItem::HomeColl(i) => {
+                if let Some(c) = self.home_colls.get(i).cloned() {
+                    self.open_collection(c);
+                }
+            }
+            RowItem::Mix(i) => {
+                if let Some(c) = self.mixes.get(i).cloned() {
+                    self.open_collection(c);
+                }
+            }
             RowItem::Playlist(i) => {
                 if let Some(p) = self.playlists.get(i).cloned() {
-                    let tracks = self.db.playlist_tracks(p.id);
-                    if !tracks.is_empty() {
-                        self.tab = Tab::Queue;
-                        self.play_tracks(tracks, 0);
-                    }
+                    self.open_playlist(p);
                 }
             }
-            RowItem::AddTo(pid) => {
-                if let Some(t) = self.track.clone() {
+            RowItem::AddTo(pid) => match self.track.clone() {
+                Some(t) => {
                     let _ = self.db.add_to_playlist(pid, &t);
                     self.refresh_library();
-                    self.set_status("Añadida a la lista");
+                    let name = self
+                        .playlists
+                        .iter()
+                        .find(|p| p.id == pid)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    self.set_status(&format!("Añadida a «{name}»"));
                 }
-            }
-            RowItem::Track(i) => {
-                if self.library.get(i).is_some() {
-                    let list = self.library.clone();
-                    self.tab = Tab::Queue;
-                    self.play_tracks(list, i);
-                }
-            }
-            RowItem::Result(i) => {
-                if self.results.get(i).is_some() {
-                    let list = self.results.clone();
-                    self.tab = Tab::Lyrics;
-                    self.close_entry();
-                    self.play_tracks(list, i);
-                }
-            }
-            RowItem::QueueTrack(i) => {
-                if let Some(t) = self.queue.get(i).cloned() {
-                    self.index = i;
-                    self.begin_track(t);
-                }
-            }
-            RowItem::Lyric(i) => {
-                if let Some(line) = self.lyrics.get(i) {
-                    self.seek_to(line.t);
+                None => self.set_status("Pon una canción para añadirla a la lista"),
+            },
+            RowItem::DeletePlaylist(pid) => {
+                let confirmed = self
+                    .confirm_delete
+                    .is_some_and(|(id, at)| id == pid && at.elapsed().as_secs() < 4);
+                if confirmed {
+                    let _ = self.db.delete_playlist(pid);
+                    self.confirm_delete = None;
+                    self.refresh_library();
+                    self.clamp_scroll();
+                    self.set_status("Lista eliminada");
+                } else {
+                    self.confirm_delete = Some((pid, Instant::now()));
+                    self.set_status("Pulsa otra vez la ✕ para eliminar la lista");
                 }
             }
             RowItem::NewPlaylist => self.new_playlist(),
-            RowItem::Header(_) => {}
+            RowItem::Import => self.import_account(),
+            RowItem::Back => self.close_detail(),
+            RowItem::DetailPlay | RowItem::DetailShuffle => {
+                if let Some(d) = self.detail.clone() {
+                    if d.tracks.is_empty() {
+                        return;
+                    }
+                    let shuffle = item == RowItem::DetailShuffle;
+                    let mut list = d.tracks.clone();
+                    if shuffle {
+                        shuffle_vec(&mut list);
+                    }
+                    self.shuffle = false;
+                    self.play_tracks(list, 0);
+                    self.set_status(&format!("Reproduciendo «{}»", d.title));
+                }
+            }
+            RowItem::DetailSave => self.save_detail(),
+            RowItem::Lyric(i) => {
+                if self.lyrics_synced {
+                    if let Some(line) = self.lyrics.get(i) {
+                        let t = line.t;
+                        self.seek_to(t);
+                        self.lyric_manual = Instant::now() - Duration::from_secs(30);
+                    }
+                }
+            }
+            RowItem::Header(_) | RowItem::Message(_) => {}
         }
         self.dirty = true;
     }
@@ -985,7 +1301,6 @@ impl App {
     // ----------------------------------------------------------- playback
     fn toggle_play(&mut self) {
         if self.track.is_none() {
-            self.tab = Tab::Search;
             self.open_search();
             return;
         }
@@ -1028,17 +1343,40 @@ impl App {
             self.set_status("Pon una canción primero");
             return;
         }
+        if on && self.source == Source::Spotify {
+            self.set_status("El vídeo solo está disponible con YouTube");
+            return;
+        }
         self.video = on;
         self.video_at = Instant::now();
-        self.mpv.video(on);
         if on {
-            self.set_status("Buscando vídeo…");
-            // Get the notch out of the way so the video window has room.
-            self.collapse();
+            self.find_video();
+            self.set_status("Buscando el videoclip…");
+            self.tab = Tab::Lyrics;
+            self.close_entry();
+            if !self.expanded {
+                self.expand();
+            }
         } else {
+            self.mpv.video(false, None);
+            self.video_surface = None;
             self.set_status("Modo audio");
         }
         self.dirty = true;
+    }
+
+    /// Look up the official video of the current song and switch to it.
+    fn find_video(&mut self) {
+        let Some(t) = self.track.clone() else { return };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let vid = if t.source == "youtube" {
+                ytm::music_video(&t.title, &t.artist).filter(|v| *v != t.id)
+            } else {
+                None
+            };
+            let _ = tx.send(Event::VideoFound(t.id, vid));
+        });
     }
 
     /// Switch the active audio source. The notch always reflects (and
@@ -1053,6 +1391,9 @@ impl App {
                 if !sp.available {
                     self.set_status("Spotify no está disponible");
                     return;
+                }
+                if self.video {
+                    self.set_video(false);
                 }
                 self.yt_track = self.track.clone();
                 self.yt_pos = self.pos;
@@ -1146,11 +1487,7 @@ impl App {
             return;
         }
         let next = if self.shuffle && n > 1 {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as usize)
-                .unwrap_or(0);
-            let mut i = seed % n;
+            let mut i = random_index(n);
             if i == self.index {
                 i = (i + 1) % n;
             }
@@ -1159,16 +1496,23 @@ impl App {
             self.index + 1
         };
         if next >= n {
-            if auto && self.repeat == Repeat::Off {
-                self.playing = false;
-                self.mpv.pause(true);
-                self.dirty = true;
+            if self.repeat == Repeat::All {
+                self.play_index(0);
                 return;
             }
-            self.play_index(0);
-        } else {
-            self.play_index(next);
+            // End of the queue: keep going with YouTube Music's radio.
+            if let Some(t) = self.track.clone() {
+                self.radio_waiting = true;
+                self.request_radio(&t.id);
+                self.set_status("Buscando canciones parecidas…");
+            }
+            if auto {
+                self.playing = false;
+                self.dirty = true;
+            }
+            return;
         }
+        self.play_index(next);
     }
 
     fn prev(&mut self) {
@@ -1195,15 +1539,83 @@ impl App {
         }
     }
 
+    /// Play a whole list (album, playlist, saved songs) starting at `i`.
     fn play_tracks(&mut self, list: Vec<Track>, i: usize) {
         if list.is_empty() {
             return;
         }
         self.queue = list;
         self.index = i.min(self.queue.len() - 1);
+        self.radio_seed.clear();
+        self.radio_waiting = false;
         if let Some(t) = self.queue.get(self.index).cloned() {
             self.begin_track(t);
         }
+    }
+
+    /// Play one song and let the radio fill the queue after it, like
+    /// YouTube Music does when you pick a song from search.
+    fn play_single(&mut self, t: Track) {
+        self.queue = vec![t.clone()];
+        self.index = 0;
+        self.radio_seed.clear();
+        self.radio_waiting = false;
+        self.begin_track(t.clone());
+        self.request_radio(&t.id);
+    }
+
+    fn play_from(&mut self, list: List, i: usize) {
+        let Some(t) = self.list_track(list, i).cloned() else { return };
+        match list {
+            List::Queue => self.play_index(i),
+            List::Results | List::Home | List::History => self.play_single(t),
+            List::Saved => {
+                let all = self.library.clone();
+                self.play_tracks(all, i);
+            }
+            List::Detail => {
+                if let Some(d) = self.detail.clone() {
+                    self.play_tracks(d.tracks, i);
+                }
+            }
+        }
+    }
+
+    fn enqueue_next(&mut self, t: Track) {
+        if self.queue.is_empty() || self.track.is_none() {
+            self.play_single(t);
+            return;
+        }
+        if let Some(pos) = self.queue.iter().position(|x| x.id == t.id) {
+            if pos == self.index {
+                return;
+            }
+            self.queue.remove(pos);
+            if pos < self.index {
+                self.index -= 1;
+            }
+        }
+        let at = (self.index + 1).min(self.queue.len());
+        self.queue.insert(at, t.clone());
+        self.set_status(&format!("«{}» sonará a continuación", t.title));
+    }
+
+    fn request_radio(&mut self, seed: &str) {
+        if seed.is_empty() || self.source != Source::YouTube {
+            return;
+        }
+        if self.radio_loading && self.radio_seed == seed {
+            return;
+        }
+        self.radio_seed = seed.to_string();
+        self.radio_loading = true;
+        let tx = self.tx.clone();
+        let seed = seed.to_string();
+        std::thread::spawn(move || {
+            let tracks = ytm::radio(&seed).unwrap_or_default();
+            let _ = tx.send(Event::RadioDone(seed, tracks));
+        });
+        self.dirty = true;
     }
 
     fn begin_track(&mut self, t: Track) {
@@ -1219,8 +1631,16 @@ impl App {
         self.dur = t.duration;
         self.playing = true;
         self.last_pos = -1.0;
+        self.has_video = false;
+        self.video_surface = None;
         self.mpv.load(&t.url());
-        let _ = self.db.save_track(&t);
+        if self.video {
+            self.video_at = Instant::now();
+            self.find_video();
+        }
+        self.mpv.pause(false);
+        self.db.touch_played(&t);
+        self.current_saved = self.db.is_saved(&t.id);
         self.start_lyrics(t.clone());
         self.start_cover(&t);
         self.dirty = true;
@@ -1251,8 +1671,12 @@ impl App {
             let id = t.id.clone();
             match lyrics::fetch(&t) {
                 Ok(l) => {
-                    if let Ok(db) = Db::open() {
-                        let _ = db.save_lyrics(&id, l.synced_text.as_deref(), &l.plain_text);
+                    // Cache only timed lyrics; plain text is retried next
+                    // time in case a synced version shows up (or LRCLIB was down).
+                    if l.synced {
+                        if let Ok(db) = Db::open() {
+                            let _ = db.save_lyrics(&id, l.synced_text.as_deref(), &l.plain_text);
+                        }
                     }
                     let _ = tx.send(Event::LyricsDone(id, l.lines, l.synced));
                 }
@@ -1285,35 +1709,72 @@ impl App {
         if self.track.as_ref().map(|t| t.id.as_str()) != Some(id) {
             return;
         }
-        if let Some(mut surface) = decode_surface(path) {
+        if let Some(mut surface) = decode_surface(path, 0) {
             self.accent = theme::accent_from_surface(&mut surface);
             self.cover = Some(surface);
             self.dirty = true;
         }
     }
 
+    /// Thumbnail for a list row; queues a download the first time.
+    pub fn thumb(&self, url: &str) -> Option<cairo::ImageSurface> {
+        if url.is_empty() {
+            return None;
+        }
+        let small = ytm::small_art(url);
+        let mut map = self.thumbs.borrow_mut();
+        match map.get(&small) {
+            Some(s) => s.clone(),
+            None => {
+                map.insert(small.clone(), None);
+                let _ = self.thumb_tx.send(small);
+                None
+            }
+        }
+    }
+
     // -------------------------------------------------------------- search
     fn open_search(&mut self) {
+        if !self.expanded {
+            self.expand();
+        }
         self.tab = Tab::Search;
+        if self.detail_here() {
+            return;
+        }
         self.entry_mode = EntryMode::Search;
-        self.entry.set_placeholder_text(Some("Buscar en YouTube Music…"));
-        if self.entry.text().to_string() != self.search_query {
+        self.entry.set_placeholder_text(Some("Canciones, artistas, álbumes o un enlace de lista…"));
+        if self.entry.text().as_str() != self.search_query {
             self.entry.set_text(&self.search_query);
         }
-        self.entry.set_visible(true);
-        self.entry.grab_focus();
-        self.entry_shown = true;
+        self.entry_shown = false; // let sync_entry show and focus it
+        self.load_home();
         self.dirty = true;
+    }
+
+    fn load_home(&mut self) {
+        if self.home_state == 1 || self.home_state == 2 {
+            return;
+        }
+        self.home_state = 1;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || match ytm::home() {
+            Ok((colls, tracks)) => {
+                let _ = tx.send(Event::HomeDone(colls, tracks));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::HomeDone(Vec::new(), Vec::new()));
+            }
+        });
     }
 
     fn new_playlist(&mut self) {
         self.tab = Tab::Library;
+        self.detail = None;
         self.entry_mode = EntryMode::NewPlaylist;
-        self.entry.set_placeholder_text(Some("Nombre de la lista…"));
+        self.entry.set_placeholder_text(Some("Nombre de la nueva lista y Enter…"));
         self.entry.set_text("");
-        self.entry.set_visible(true);
-        self.entry.grab_focus();
-        self.entry_shown = true;
+        self.entry_shown = false;
         self.dirty = true;
     }
 
@@ -1328,39 +1789,64 @@ impl App {
     }
 
     fn sync_entry(&mut self) {
-        let want = self.visible && self.entry_mode != EntryMode::Hidden && self.expanded;
+        let want = self.visible
+            && self.expanded
+            && self.anim > 0.95
+            && self.entry_mode != EntryMode::Hidden
+            && !(self.tab == Tab::Search && self.detail_here())
+            && (self.tab == Tab::Search || self.entry_mode == EntryMode::NewPlaylist);
+        if want {
+            let l = self.layout();
+            let k = self.ui_scale;
+            self.entry.set_margin_start((l.entry.x * k).round() as i32);
+            self.entry.set_margin_top((l.entry.y * k).round() as i32);
+            self.entry
+                .set_size_request((l.entry.w * k).round() as i32, (l.entry.h * k).round() as i32);
+        }
         if want != self.entry_shown {
             self.entry_shown = want;
             self.entry.set_visible(want);
             if want {
                 self.entry.grab_focus();
+                self.entry.set_position(-1);
             }
-        }
-        if want {
-            let l = self.layout();
-            let k = self.ui_scale;
-            self.fixed.move_(&self.entry, l.entry.x * k, l.entry.y * k);
-            self.entry
-                .set_size_request((l.entry.w * k) as i32, (l.entry.h * k) as i32);
+            self.dirty = true;
         }
     }
 
     fn run_search(&mut self) {
         let q = self.search_query.trim().to_string();
-        if q.is_empty() {
+        if q.is_empty() || q == self.searched {
             return;
         }
+        if let Some(list) = ytm::playlist_from_url(&q) {
+            self.searched = q;
+            self.open_collection(Collection {
+                id: format!("VL{list}"),
+                title: "Lista de YouTube".into(),
+                subtitle: String::new(),
+                art: String::new(),
+                kind: CollKind::Playlist,
+            });
+            return;
+        }
+        self.searched = q.clone();
         self.searching = true;
-        self.results.clear();
         self.dirty = true;
         let tx = self.tx.clone();
-        std::thread::spawn(move || match yt::search(&q, 24) {
-            Ok(tracks) => {
-                let _ = tx.send(Event::SearchDone(q, tracks));
+        std::thread::spawn(move || match ytm::search(&q) {
+            Ok((tracks, colls)) if !tracks.is_empty() || !colls.is_empty() => {
+                let _ = tx.send(Event::SearchDone(q, tracks, colls));
             }
-            Err(e) => {
-                let _ = tx.send(Event::Error(format!("Búsqueda: {e}")));
-                let _ = tx.send(Event::SearchDone(q, Vec::new()));
+            other => {
+                // Fall back to plain YouTube search if YouTube Music fails.
+                let tracks = yt::search(&q, 20).unwrap_or_default();
+                if tracks.is_empty() {
+                    if let Err(e) = other {
+                        let _ = tx.send(Event::Error(format!("Búsqueda: {e}")));
+                    }
+                }
+                let _ = tx.send(Event::SearchDone(q, tracks, Vec::new()));
             }
         });
     }
@@ -1371,54 +1857,299 @@ impl App {
             return;
         }
         match self.db.create_playlist(&name) {
-            Ok(_) => {
+            Ok(pid) => {
+                if let Some(t) = self.track.clone() {
+                    let _ = self.db.add_to_playlist(pid, &t);
+                    self.set_status(&format!("Lista «{name}» creada con la canción actual"));
+                } else {
+                    self.set_status(&format!("Lista «{name}» creada"));
+                }
                 self.refresh_library();
-                self.set_status("Lista creada");
             }
             Err(e) => self.set_status(&format!("No se pudo crear: {e}")),
         }
         self.close_entry();
     }
 
+    // --------------------------------------------------------- collections
+    fn open_collection(&mut self, c: Collection) {
+        // Already in the library? Open the local copy instead.
+        if let Some(p) = self.playlists.iter().find(|p| !p.remote.is_empty() && p.remote == c.id).cloned() {
+            self.open_playlist(p);
+            return;
+        }
+        let tab = if self.tab == Tab::Library { Tab::Library } else { Tab::Search };
+        self.detail = Some(Detail {
+            key: c.id.clone(),
+            title: c.title.clone(),
+            subtitle: c.subtitle.clone(),
+            art: c.art.clone(),
+            kind: c.kind,
+            tracks: Vec::new(),
+            loading: true,
+            local: None,
+            remote: if c.kind == CollKind::Mix { String::new() } else { c.id.clone() },
+            tab,
+        });
+        self.tab = tab;
+        self.list_scroll = 0.0;
+        let tx = self.tx.clone();
+        let id = c.id.clone();
+        std::thread::spawn(move || {
+            let (title, tracks) = ytm::collection(&id).unwrap_or_default();
+            let _ = tx.send(Event::CollectionDone(id, title, tracks));
+        });
+        self.dirty = true;
+    }
+
+    fn open_playlist(&mut self, p: Playlist) {
+        let tracks = self.db.playlist_tracks(p.id);
+        let key = format!("local:{}", p.id);
+        let remote = p.remote.clone();
+        let refresh = !remote.is_empty();
+        self.detail = Some(Detail {
+            key: key.clone(),
+            title: p.name.clone(),
+            subtitle: if remote.is_empty() {
+                "Tu lista".into()
+            } else if remote.starts_with("MPRE") {
+                "Álbum guardado".into()
+            } else {
+                "Lista de YouTube Music".into()
+            },
+            art: if p.art.is_empty() {
+                tracks.first().map(|t| t.art.clone()).unwrap_or_default()
+            } else {
+                p.art.clone()
+            },
+            kind: CollKind::Playlist,
+            loading: refresh,
+            tracks,
+            local: Some(p.id),
+            remote: remote.clone(),
+            tab: Tab::Library,
+        });
+        self.tab = Tab::Library;
+        self.close_entry();
+        self.list_scroll = 0.0;
+        if refresh {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let list_id = remote.strip_prefix("VL").unwrap_or(&remote).to_string();
+                // Public lists come straight from YouTube Music; private ones
+                // (and "Liked music") need the browser session via yt-dlp.
+                let mut tracks = Vec::new();
+                if list_id != "LM" {
+                    tracks = ytm::collection(&remote).map(|r| r.1).unwrap_or_default();
+                }
+                if tracks.is_empty() && remote.starts_with("VL") {
+                    let url = format!("https://music.youtube.com/playlist?list={list_id}");
+                    match yt::playlist(&url) {
+                        Ok(t) => tracks = t,
+                        Err(e) => {
+                            let _ = tx.send(Event::Error(format!("No se pudo leer la lista: {e}")));
+                        }
+                    }
+                }
+                let _ = tx.send(Event::CollectionDone(key, String::new(), tracks));
+            });
+        }
+        self.dirty = true;
+    }
+
+    fn close_detail(&mut self) {
+        self.detail = None;
+        self.list_scroll = 0.0;
+        if self.tab == Tab::Search {
+            self.open_search();
+        }
+        self.dirty = true;
+    }
+
+    fn save_detail(&mut self) {
+        let Some(d) = self.detail.clone() else { return };
+        if d.tracks.is_empty() {
+            return;
+        }
+        let art = if d.art.is_empty() { d.tracks[0].art.clone() } else { d.art.clone() };
+        let pid = if d.remote.is_empty() {
+            self.db.create_playlist(&d.title)
+        } else {
+            self.db.upsert_remote_playlist(&d.title, &d.remote, &ytm::big_art(&art))
+        };
+        match pid {
+            Ok(pid) => {
+                let _ = self.db.set_playlist_tracks(pid, &d.tracks);
+                if let Some(cur) = self.detail.as_mut() {
+                    cur.local = Some(pid);
+                }
+                self.refresh_library();
+                self.set_status(&format!("«{}» guardada en tu biblioteca", d.title));
+            }
+            Err(e) => self.set_status(&format!("No se pudo guardar: {e}")),
+        }
+    }
+
+    fn import_account(&mut self) {
+        if self.importing {
+            return;
+        }
+        self.importing = true;
+        self.set_status("Importando tus listas de YouTube Music…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = yt::account_playlists().map_err(|e| e.to_string()).and_then(|lists| {
+                let db = Db::open().map_err(|e| e.to_string())?;
+                for (id, title) in &lists {
+                    let _ = db.upsert_remote_playlist(title, &format!("VL{id}"), "");
+                }
+                Ok(lists.len())
+            });
+            let _ = tx.send(Event::ImportDone(result));
+        });
+    }
+
     fn list_extent(&self) -> f64 {
         let l = self.layout();
-        let total = match self.tab {
-            Tab::Library => {
-                4.0 + 26.0
-                    + self.playlists.len() as f64 * 44.0
-                    + 44.0
-                    + 26.0
-                    + self.library.len() as f64 * 50.0
-            }
-            Tab::Search => 4.0 + self.results.len() as f64 * 52.0,
-            Tab::Queue => 4.0 + self.queue.len() as f64 * 50.0,
-            Tab::Lyrics => 0.0,
-        };
-        (total - l.content.h).max(0.0)
+        let bottom = self
+            .rows(l.content)
+            .iter()
+            .map(|(r, _)| r.y + r.h)
+            .fold(l.content.y, f64::max);
+        (bottom + self.list_scroll - l.content.y - l.content.h + 12.0).max(0.0)
     }
 
     fn scroll_list(&mut self, dy: f64) {
         let max = self.list_extent();
-        self.list_scroll = (self.list_scroll - dy * 52.0).clamp(0.0, max);
+        self.list_scroll = (self.list_scroll + dy * 52.0).clamp(0.0, max);
         self.dirty = true;
+    }
+
+    fn clamp_scroll(&mut self) {
+        let max = self.list_extent();
+        self.list_scroll = self.list_scroll.clamp(0.0, max);
     }
 
     fn refresh_library(&mut self) {
         self.library = self.db.library();
+        self.history = self.db.history(25);
         self.playlists = self.db.playlists();
+        // A mix per recent artist, seeded with their latest song.
+        let mut mixes: Vec<Collection> = Vec::new();
+        for t in &self.history {
+            if mixes.len() >= 4 {
+                break;
+            }
+            let artist = lyrics::main_artist(&t.artist);
+            if t.source != "youtube" || mixes.iter().any(|m| m.subtitle.ends_with(&artist)) {
+                continue;
+            }
+            mixes.push(Collection {
+                id: format!("RDAMVM{}", t.id),
+                title: format!("Mix de {}", if artist.is_empty() { &t.title } else { &artist }),
+                subtitle: format!("A partir de «{}» · {}", t.title, artist),
+                art: t.art.clone(),
+                kind: CollKind::Mix,
+            });
+        }
+        self.mixes = mixes;
         self.dirty = true;
     }
 
     // --------------------------------------------------------------- events
     fn handle_event(&mut self, ev: Event) {
         match ev {
-            Event::SearchDone(q, tracks) => {
-                if q == self.search_query {
+            Event::SearchDone(q, tracks, colls) => {
+                if q == self.searched {
                     self.results = tracks;
+                    self.colls = colls;
                     self.searching = false;
-                    self.list_scroll = 0.0;
-                    self.tab = Tab::Search;
+                    if self.tab == Tab::Search && !self.detail_here() {
+                        self.list_scroll = 0.0;
+                    }
                     self.dirty = true;
+                }
+            }
+            Event::HomeDone(colls, tracks) => {
+                self.home_state = if colls.is_empty() && tracks.is_empty() { 3 } else { 2 };
+                self.home_colls = colls.into_iter().take(12).collect();
+                self.home_tracks = tracks.into_iter().take(20).collect();
+                self.dirty = true;
+            }
+            Event::CollectionDone(key, title, tracks) => {
+                if let Some(pid) = key.strip_prefix("local:").and_then(|p| p.parse::<i64>().ok()) {
+                    if !tracks.is_empty() {
+                        let _ = self.db.set_playlist_tracks(pid, &tracks);
+                        if let Some(p) = self.playlists.iter().find(|p| p.id == pid).cloned() {
+                            if p.art.is_empty() && !p.remote.is_empty() {
+                                let _ = self.db.upsert_remote_playlist(&p.name, &p.remote, &ytm::big_art(&tracks[0].art));
+                            }
+                        }
+                        self.refresh_library();
+                    }
+                }
+                if let Some(d) = self.detail.as_mut().filter(|d| d.key == key) {
+                    d.loading = false;
+                    if !tracks.is_empty() || d.tracks.is_empty() {
+                        d.tracks = tracks;
+                    }
+                    if !title.is_empty() && (d.title.is_empty() || d.title == "Lista de YouTube") {
+                        d.title = title;
+                    }
+                    if d.art.is_empty() {
+                        d.art = d.tracks.first().map(|t| t.art.clone()).unwrap_or_default();
+                    }
+                    if d.subtitle.is_empty() {
+                        d.subtitle = format!("{} canciones", d.tracks.len());
+                    }
+                    self.dirty = true;
+                }
+            }
+            Event::RadioDone(seed, tracks) => {
+                if seed != self.radio_seed {
+                    return;
+                }
+                self.radio_loading = false;
+                let before = self.queue.len();
+                for t in tracks {
+                    if !self.queue.iter().any(|x| x.id == t.id) {
+                        self.queue.push(t);
+                    }
+                }
+                if self.radio_waiting {
+                    self.radio_waiting = false;
+                    if self.queue.len() > before {
+                        self.play_index(before);
+                    } else {
+                        self.set_status("No hay más canciones en la cola");
+                    }
+                }
+                self.dirty = true;
+            }
+            Event::ThumbDone(url, path) => {
+                let surf = decode_surface(&path, 112);
+                if surf.is_none() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                self.thumbs.borrow_mut().insert(url, surf);
+                self.dirty = true;
+            }
+            Event::ImportDone(result) => {
+                self.importing = false;
+                match result {
+                    Ok(n) => {
+                        self.refresh_library();
+                        self.set_status(&format!("{n} listas importadas de YouTube Music"));
+                    }
+                    Err(e) => self.set_status(&format!("No se pudo importar: {e}")),
+                }
+            }
+            Event::VideoFound(id, vid) => {
+                if self.video && self.track.as_ref().is_some_and(|t| t.id == id) {
+                    self.video_at = Instant::now();
+                    let url = vid.map(|v| format!("https://www.youtube.com/watch?v={v}"));
+                    self.mpv.video(true, url);
+                    self.set_status("Cargando vídeo…");
                 }
             }
             Event::LyricsDone(id, lines, synced) => {
@@ -1469,9 +2200,11 @@ impl App {
             Cmd::Play { id, title, artist } => self.play_id(&id, title, artist),
             Cmd::Search { query } => {
                 self.show();
+                self.detail = None;
                 if let Some(q) = query {
                     self.search_query = q;
                     self.open_search();
+                    self.searched.clear();
                     self.run_search();
                 } else {
                     self.open_search();
@@ -1482,7 +2215,7 @@ impl App {
                 self.app.quit();
             }
             Cmd::ToggleVideo => self.set_video(!self.video),
-            Cmd::Click { x, y } => self.on_press(x, y),
+            Cmd::Click { x, y } => self.on_press(x * self.ui_scale, y * self.ui_scale),
             Cmd::Status => {}
         }
     }
@@ -1491,6 +2224,7 @@ impl App {
         let find = |list: &Vec<Track>| list.iter().find(|t| t.id == id).cloned();
         let found = find(&self.results)
             .or_else(|| find(&self.library))
+            .or_else(|| find(&self.history))
             .or_else(|| find(&self.queue));
         let track = found.unwrap_or_else(|| Track {
             id: id.to_string(),
@@ -1502,9 +2236,7 @@ impl App {
             source: "youtube".into(),
         });
         self.show();
-        self.queue = vec![track.clone()];
-        self.index = 0;
-        self.begin_track(track);
+        self.play_single(track);
     }
 
     // ------------------------------------------------------------- window
@@ -1627,7 +2359,9 @@ impl App {
 
     fn collapse(&mut self) {
         self.expanded = false;
-        self.close_entry();
+        if self.entry_mode == EntryMode::NewPlaylist {
+            self.close_entry();
+        }
         self.start_anim(0.0);
     }
 
@@ -1637,7 +2371,9 @@ impl App {
         }
         self.hiding = true;
         self.expanded = false;
-        self.close_entry();
+        if self.entry_mode == EntryMode::NewPlaylist {
+            self.close_entry();
+        }
         if self.anim <= 0.01 {
             self.window.set_visible(false);
             self.visible = false;
@@ -1659,7 +2395,6 @@ impl App {
             s.pos = self.pos;
             s.duration = self.dur;
             s.volume = self.volume;
-            s.playing = self.playing;
             s.expanded = self.expanded;
             s.queue_len = self.queue.len();
             if let Some(t) = &self.track {
@@ -1676,6 +2411,36 @@ impl App {
                 s.source.clear();
             }
         }
+    }
+
+    /// Copy the newest video frame into a Cairo surface.
+    fn pull_video_frame(&mut self) {
+        let Ok(frame) = self.mpv.frame.lock() else { return };
+        let serial = frame.serial.load(std::sync::atomic::Ordering::Relaxed);
+        if serial == self.video_serial {
+            return;
+        }
+        self.video_serial = serial;
+        if self.video_surface.is_none() {
+            self.video_surface =
+                cairo::ImageSurface::create(cairo::Format::Rgb24, mpv::VIDEO_W, mpv::VIDEO_H).ok();
+        }
+        let Some(surface) = self.video_surface.as_mut() else { return };
+        let stride = surface.stride() as usize;
+        let src_stride = (mpv::VIDEO_W * 4) as usize;
+        surface.flush();
+        if let Ok(mut data) = surface.data() {
+            if stride == src_stride && data.len() >= frame.data.len() {
+                data[..frame.data.len()].copy_from_slice(&frame.data);
+            } else {
+                for row in 0..mpv::VIDEO_H as usize {
+                    let s = &frame.data[row * src_stride..(row + 1) * src_stride];
+                    data[row * stride..row * stride + src_stride].copy_from_slice(s);
+                }
+            }
+        }
+        surface.mark_dirty();
+        self.dirty = true;
     }
 
     fn tick(&mut self) {
@@ -1708,6 +2473,9 @@ impl App {
                 self.set_status("Reproduciendo vídeo");
             }
         }
+        if self.video && self.has_video {
+            self.pull_video_frame();
+        }
         if (pos - self.pos).abs() > 0.001 {
             self.last_pos = self.pos;
             self.pos = pos;
@@ -1735,6 +2503,34 @@ impl App {
             self.dirty = true;
         }
 
+        // Keep something queued after the current song (autoplay).
+        if self.source == Source::YouTube
+            && self.repeat == Repeat::Off
+            && !self.radio_loading
+            && self.index + 1 >= self.queue.len()
+        {
+            if let Some(id) = self.track.as_ref().map(|t| t.id.clone()) {
+                if self.radio_seed != id && self.track.as_ref().is_some_and(|t| t.source == "youtube") {
+                    self.request_radio(&id);
+                }
+            }
+        }
+
+        // Search as you type.
+        if let Some(at) = self.search_edit {
+            if at.elapsed() > Duration::from_millis(550) {
+                self.search_edit = None;
+                if self.search_query.trim().chars().count() >= 2 {
+                    self.run_search();
+                } else if self.search_query.trim().is_empty() {
+                    self.results.clear();
+                    self.colls.clear();
+                    self.searched.clear();
+                    self.dirty = true;
+                }
+            }
+        }
+
         if self.animating {
             let t = (self.anim_t0.elapsed().as_secs_f64() * 1000.0 / ANIM_MS).min(1.0);
             let e = 1.0 - (1.0 - t).powi(3);
@@ -1760,9 +2556,10 @@ impl App {
             self.dirty = true;
         }
 
-        if self.video && !self.has_video && self.video_at.elapsed().as_millis() > 9000 {
+        if self.video && !self.has_video && self.video_at.elapsed().as_millis() > 12000 {
             self.video = false;
-            self.mpv.video(false);
+            self.video_surface = None;
+            self.mpv.video(false, None);
             self.set_status("Esta canción no tiene vídeo");
         }
 
@@ -1774,13 +2571,11 @@ impl App {
                 .unwrap_or(0);
             if idx != self.lyric_idx {
                 self.lyric_idx = idx;
-                self.lyric_manual = Instant::now() - Duration::from_secs(30);
                 self.dirty = true;
             }
-            let l = self.layout();
-            if l.content.h > 0.0 && self.lyric_manual.elapsed().as_secs() > 3 {
-                let target =
-                    l.content.y + 12.0 + idx as f64 * 46.0 + 23.0 - l.content.cy();
+            let lr = self.layout().lyrics;
+            if lr.h > 0.0 && self.lyric_manual.elapsed().as_secs() > 4 {
+                let target = 12.0 + idx as f64 * 46.0 + 23.0 - lr.h / 2.0;
                 let delta = target - self.lyric_scroll;
                 if delta.abs() > 0.5 {
                     self.lyric_scroll += delta * 0.10;
@@ -1815,29 +2610,54 @@ impl App {
     }
 }
 
-fn decode_surface(path: &std::path::Path) -> Option<cairo::ImageSurface> {
+fn random_index(n: usize) -> usize {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize ^ (d.as_secs() as usize).rotate_left(17))
+        .unwrap_or(0);
+    // xorshift to spread consecutive calls.
+    let mut x = seed | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x % n.max(1)
+}
+
+fn shuffle_vec<T>(v: &mut [T]) {
+    let mut x = random_index(usize::MAX) | 1;
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.swap(i, x % (i + 1));
+    }
+}
+
+/// Decode an image into a Cairo surface; `max` > 0 downsizes it first (list
+/// thumbnails), keeping memory and paint cost low.
+fn decode_surface(path: &std::path::Path, max: u32) -> Option<cairo::ImageSurface> {
     let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-    let img = reader.decode().ok()?.to_rgba8();
+    let mut img = reader.decode().ok()?;
+    if max > 0 && (img.width() > max || img.height() > max) {
+        img = img.thumbnail(max, max);
+    }
+    let img = img.to_rgba8();
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return None;
     }
-    let mut surface = cairo::ImageSurface::create(
-        cairo::Format::ARgb32,
-        w as i32,
-        h as i32,
-    )
-    .ok()?;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32).ok()?;
     let stride = surface.stride() as usize;
     {
         let mut data = surface.data().ok()?;
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let p = img.get_pixel(x as u32, y as u32);
+        for (y, row) in img.rows().enumerate() {
+            for (x, p) in row.enumerate() {
                 let i = y * stride + x * 4;
-                data[i] = p[2];
-                data[i + 1] = p[1];
-                data[i + 2] = p[0];
+                let a = p[3] as u32;
+                // Cairo wants premultiplied BGRA.
+                data[i] = (p[2] as u32 * a / 255) as u8;
+                data[i + 1] = (p[1] as u32 * a / 255) as u8;
+                data[i + 2] = (p[0] as u32 * a / 255) as u8;
                 data[i + 3] = p[3];
             }
         }

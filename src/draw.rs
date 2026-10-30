@@ -3,9 +3,9 @@ use gtk4 as gtk;
 use cairo::{Context, Filter, ImageSurface, LineCap, LineJoin, SurfacePattern};
 use gtk::pango;
 
-use crate::model::{Rect, Source, Track};
+use crate::model::{CollKind, Rect, Source, Track};
 use crate::theme::{self, Rgb};
-use crate::ui::{App, Hit, RowItem, Tab};
+use crate::ui::{App, Hit, List, RowItem, Tab};
 
 #[allow(dead_code)]
 const PAD: f64 = 0.0;
@@ -191,6 +191,8 @@ pub enum Icon {
     Volume,
     ChevronUp,
     ChevronDown,
+    ChevronLeft,
+    PlayNext,
     Search,
     Plus,
     Close,
@@ -294,6 +296,28 @@ fn icon(cr: &Context, kind: Icon, cx: f64, cy: f64, s: f64, color: Rgb, alpha: f
             cr.line_to(cx, cy + h * 0.32);
             cr.line_to(cx + h * 0.55, cy - h * 0.22);
             cr.stroke();
+        }
+        Icon::ChevronLeft => {
+            cr.move_to(cx + h * 0.22, cy - h * 0.55);
+            cr.line_to(cx - h * 0.32, cy);
+            cr.line_to(cx + h * 0.22, cy + h * 0.55);
+            cr.stroke();
+        }
+        Icon::PlayNext => {
+            // Lines with a small play triangle: "play next".
+            for i in 0..2 {
+                let yy = cy - h * 0.5 + i as f64 * h * 0.5;
+                cr.move_to(cx - h * 0.85, yy);
+                cr.line_to(cx + h * 0.15, yy);
+            }
+            cr.move_to(cx - h * 0.85, cy + h * 0.5);
+            cr.line_to(cx - h * 0.15, cy + h * 0.5);
+            cr.stroke();
+            cr.move_to(cx + h * 0.15, cy + h * 0.15);
+            cr.line_to(cx + h * 0.85, cy + h * 0.5);
+            cr.line_to(cx + h * 0.15, cy + h * 0.85);
+            cr.close_path();
+            cr.fill();
         }
         Icon::Search => {
             cr.arc(cx - h * 0.15, cy - h * 0.15, h * 0.55, 0.0, std::f64::consts::TAU);
@@ -487,8 +511,10 @@ impl App {
             }
         }
 
-        // Artwork.
-        if let Some(surface) = &self.cover {
+        // Artwork (or the video itself, in miniature).
+        if let Some(frame) = self.video_surface.as_ref().filter(|_| self.showing_video()) {
+            rounded_pic(cr, l.art, 13.0, frame);
+        } else if let Some(surface) = &self.cover {
             rounded_pic(cr, l.art, 13.0, surface);
         } else {
             placeholder_art(cr, l.art, 13.0, self.accent, a);
@@ -724,8 +750,18 @@ impl App {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.12 * a);
         cr.set_line_width(1.0);
         cr.stroke();
-        icon(cr, Icon::Plus, l.save.x + 20.0, l.save.cy(), 14.0, theme::TEXT, 0.85 * a);
-        label(cr, "Guardar", l.save.x + 34.0, l.save.y + 9.0, l.save.w - 40.0, 11.5, pango::Weight::Medium, theme::TEXT, 0.85 * a);
+        if self.current_saved {
+            icon(cr, Icon::Check, l.save.x + 20.0, l.save.cy(), 14.0, self.accent.lighten(0.4), 0.95 * a);
+            label(cr, "Guardada", l.save.x + 34.0, l.save.y + 9.0, l.save.w - 40.0, 11.5, pango::Weight::Medium, self.accent.lighten(0.4), 0.95 * a);
+        } else {
+            icon(cr, Icon::Plus, l.save.x + 20.0, l.save.cy(), 14.0, theme::TEXT, 0.85 * a);
+            label(cr, "Guardar", l.save.x + 34.0, l.save.y + 9.0, l.save.w - 40.0, 11.5, pango::Weight::Medium, theme::TEXT, 0.85 * a);
+        }
+        if self.hover == Some(Hit::SaveCurrent) {
+            rr(cr, l.save.x, l.save.y, l.save.w, l.save.h, l.save.h / 2.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.05 * a);
+            cr.fill();
+        }
 
         // Video toggle.
         let vhover = self.hover == Some(Hit::Video);
@@ -808,7 +844,7 @@ impl App {
                 cr.fill();
             }
             let alpha = if active { 0.95 } else { 0.55 };
-            let shown = if i == 2 { "Buscar" } else { tabs[i] };
+            let shown = if i == 0 && self.showing_video() { "Vídeo" } else { tabs[i] };
             label(
                 cr,
                 shown,
@@ -846,17 +882,49 @@ impl App {
         let _ = cr.save();
         cr.rectangle(l.content.x - 4.0, l.content.y - 4.0, l.content.w + 8.0, l.content.h + 8.0);
         cr.clip();
-        match self.tab {
-            Tab::Lyrics => self.draw_lyrics(cr, l.content, a),
-            Tab::Library => self.draw_library(cr, l.content, a),
-            Tab::Search => self.draw_search(cr, l.content, a),
-            Tab::Queue => self.draw_queue(cr, l.content, a),
+        if self.tab == Tab::Lyrics {
+            self.draw_lyrics(cr, &l, a);
+        } else {
+            self.draw_rows(cr, l.content, a);
         }
         let _ = cr.restore();
+        if self.tab != Tab::Lyrics {
+            self.draw_scrollbar(cr, l.content, a);
+        }
     }
 
-    fn draw_lyrics(&self, cr: &Context, content: Rect, a: f64) {
+    fn draw_scrollbar(&self, cr: &Context, content: Rect, a: f64) {
+        let rows = self.rows(content);
+        let bottom = rows.iter().map(|(r, _)| r.y + r.h).fold(content.y, f64::max) + self.list_scroll;
+        let total = bottom - content.y + 12.0;
+        if total <= content.h + 1.0 {
+            return;
+        }
+        let h = (content.h * content.h / total).max(28.0);
+        let y = content.y + (content.h - h) * (self.list_scroll / (total - content.h)).clamp(0.0, 1.0);
+        rr(cr, content.x + content.w + 4.0, y, 3.0, h, 1.5);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.16 * a);
+        cr.fill();
+    }
+
+    fn draw_lyrics(&self, cr: &Context, l: &crate::ui::Layout, a: f64) {
+        let content = l.lyrics;
+        if l.screen.w > 0.0 {
+            if let Some(frame) = &self.video_surface {
+                rr(cr, l.screen.x, l.screen.y, l.screen.w, l.screen.h, 16.0);
+                cr.set_source_rgba(0.0, 0.0, 0.0, 0.9 * a);
+                cr.fill();
+                rounded_pic(cr, l.screen, 16.0, frame);
+                rr(cr, l.screen.x + 0.5, l.screen.y + 0.5, l.screen.w - 1.0, l.screen.h - 1.0, 15.5);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
+                cr.set_line_width(1.0);
+                cr.stroke();
+            }
+        }
         if self.lyrics.is_empty() {
+            if l.screen.w > 0.0 {
+                return;
+            }
             let msg = match self.lyrics_state {
                 1 => "Buscando letra…",
                 3 => "Sin letra para esta canción",
@@ -865,18 +933,23 @@ impl App {
             icon(cr, Icon::Music, content.cx(), content.y + 150.0, 42.0, theme::DIM, 0.35 * a);
             label_center(cr, msg, content.x, content.y + 190.0, content.w, 13.0, pango::Weight::Normal, theme::MUTED, 0.65 * a);
             if self.lyrics_state == 3 {
-                label_center(cr, "La letra se busca automáticamente en LRCLIB", content.x, content.y + 214.0, content.w, 10.5, pango::Weight::Normal, theme::DIM, 0.55 * a);
+                label_center(cr, "No está en LRCLIB ni en NetEase", content.x, content.y + 214.0, content.w, 10.5, pango::Weight::Normal, theme::DIM, 0.55 * a);
             }
             return;
         }
 
+        let _ = cr.save();
+        cr.rectangle(content.x - 4.0, content.y, content.w + 8.0, content.h);
+        cr.clip();
         for (r, item) in self.rows(content) {
             if let RowItem::Lyric(i) = item {
                 let Some(line) = self.lyrics.get(i) else { continue };
                 let dist = (i as i64 - self.lyric_idx as i64).abs();
-                let current = i == self.lyric_idx;
+                let current = i == self.lyric_idx && (self.lyrics_synced || self.dur > 0.0);
                 let (size, weight, color, alpha) = if current {
                     (20.0, pango::Weight::Semibold, theme::TEXT.lighten(0.05), 0.96)
+                } else if !self.lyrics_synced {
+                    (15.0, pango::Weight::Normal, theme::MUTED, 0.62)
                 } else if dist == 1 {
                     (15.0, pango::Weight::Normal, theme::MUTED, 0.55)
                 } else if dist == 2 {
@@ -884,16 +957,16 @@ impl App {
                 } else {
                     (13.5, pango::Weight::Normal, theme::DIM, 0.20)
                 };
-                let hovered = self.hover == Some(Hit::Lyric(i));
+                let hovered = self.lyrics_synced && self.hover == Some(Hit::Row(item));
                 if hovered {
                     rr(cr, r.x - 6.0, r.y + 2.0, r.w + 12.0, r.h - 4.0, 10.0);
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.045 * a);
                     cr.fill();
                 }
-                let h = para(cr, &line.text, r.x + 10.0, r.y + 2.0, r.w - 20.0, size, weight, color, alpha * a, true);
-                let _ = h;
+                para(cr, &line.text, r.x + 10.0, r.y + 2.0, r.w - 20.0, size, weight, color, alpha * a, true);
             }
         }
+        let _ = cr.restore();
 
         // Fade the list into the glass at the top and bottom.
         let top = cairo::LinearGradient::new(0.0, content.y, 0.0, content.y + 26.0);
@@ -908,6 +981,9 @@ impl App {
         cr.set_source(&bottom).ok();
         cr.rectangle(content.x, content.y + content.h - 34.0, content.w, 34.0);
         cr.fill();
+        if !self.lyrics_synced && l.screen.w <= 0.0 {
+            label(cr, "Letra sin sincronizar", content.x + content.w - 150.0, content.y + content.h - 16.0, 150.0, 9.5, pango::Weight::Normal, theme::DIM, 0.6 * a);
+        }
     }
 
     fn row_background(&self, cr: &Context, r: Rect, hovered: bool, a: f64) {
@@ -918,125 +994,232 @@ impl App {
         }
     }
 
-    fn draw_library(&self, cr: &Context, content: Rect, a: f64) {
-        for (r, item) in self.rows(content) {
-            match item {
+    fn pill(&self, cr: &Context, r: Rect, ic: Icon, text: &str, hovered: bool, accent: bool, a: f64) {
+        rr(cr, r.x, r.y, r.w, r.h, r.h / 2.0);
+        if accent {
+            set(cr, self.accent.lighten(if hovered { 0.30 } else { 0.18 }), 0.9 * a);
+        } else {
+            cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 0.10 } else { 0.05 } * a);
+        }
+        cr.fill();
+        if !accent {
+            rr(cr, r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 1.0, r.h / 2.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
+            cr.set_line_width(1.0);
+            cr.stroke();
+        }
+        let fg = if accent { Rgb::new(0.06, 0.05, 0.06) } else { theme::TEXT };
+        icon(cr, ic, r.x + 18.0, r.cy(), 13.0, fg, 0.9 * a);
+        label(cr, text, r.x + 32.0, r.cy() - 8.0, r.w - 38.0, 11.5, pango::Weight::Medium, fg, 0.92 * a);
+    }
+
+    fn thumb_or_placeholder(&self, cr: &Context, r: Rect, radius: f64, art: &str, fallback: Icon, a: f64) {
+        match self.thumb(art) {
+            Some(s) => rounded_pic(cr, r, radius, &s),
+            None => {
+                let _ = cr.save();
+                rr(cr, r.x, r.y, r.w, r.h, radius);
+                cr.clip();
+                let g = cairo::LinearGradient::new(r.x, r.y, r.x + r.w, r.y + r.h);
+                g.add_color_stop_rgba(0.0, self.accent.0 * 0.5, self.accent.1 * 0.5, self.accent.2 * 0.5, a);
+                g.add_color_stop_rgba(1.0, 0.05, 0.05, 0.07, a);
+                cr.set_source(&g).ok();
+                let _ = cr.paint();
+                let _ = cr.restore();
+                icon(cr, fallback, r.cx(), r.cy(), r.w * 0.42, Rgb::new(1.0, 1.0, 1.0), 0.6 * a);
+            }
+        }
+        rr(cr, r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 1.0, radius - 0.5);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
+        cr.set_line_width(1.0);
+        cr.stroke();
+    }
+
+    fn coll_row(&self, cr: &Context, r: Rect, title: &str, subtitle: &str, art: &str, kind: CollKind, hovered: bool, a: f64) {
+        self.row_background(cr, r, hovered, a);
+        let thumb = Rect::new(r.x + 8.0, r.y + (r.h - 42.0) / 2.0, 42.0, 42.0);
+        let fallback = if kind == CollKind::Mix { Icon::Music } else { Icon::Queue };
+        self.thumb_or_placeholder(cr, thumb, 10.0, art, fallback, a);
+        if kind == CollKind::Mix {
+            // A small radio badge so mixes read differently from playlists.
+            cr.arc(thumb.x + thumb.w - 6.0, thumb.y + thumb.h - 6.0, 7.0, 0.0, std::f64::consts::TAU);
+            set(cr, self.accent.lighten(0.25), 0.95 * a);
+            cr.fill();
+            icon(cr, Icon::Play, thumb.x + thumb.w - 5.5, thumb.y + thumb.h - 6.0, 7.0, Rgb::new(0.06, 0.05, 0.06), a);
+        }
+        let tx = r.x + 62.0;
+        let tw = r.w - 62.0 - if hovered { 84.0 } else { 16.0 };
+        label(cr, title, tx, r.y + 9.0, tw, 13.0, pango::Weight::Medium, theme::TEXT, 0.92 * a);
+        let kind_label = match kind {
+            CollKind::Album => "Álbum",
+            CollKind::Playlist => "Lista",
+            CollKind::Mix => "Mix",
+        };
+        let sub = if subtitle.is_empty() { kind_label.to_string() } else { format!("{kind_label} · {subtitle}") };
+        label(cr, &sub, tx, r.y + 28.0, tw, 10.5, pango::Weight::Normal, theme::MUTED, 0.62 * a);
+    }
+
+    fn draw_rows(&self, cr: &Context, content: Rect, a: f64) {
+        let rows = self.rows(content);
+        let visible = |r: &Rect| r.y + r.h >= content.y - 4.0 && r.y <= content.y + content.h + 4.0;
+        let (mx, my) = self.mouse;
+        let mouse_in = content.contains(mx, my);
+        let row_hovered = |r: &Rect| mouse_in && r.contains(mx, my);
+
+        // Pass 1: rows.
+        for (r, item) in &rows {
+            if !visible(r) {
+                continue;
+            }
+            let hovered = row_hovered(r);
+            match *item {
                 RowItem::Header(text) => {
-                    if r.y + r.h > content.y && r.y < content.y + content.h {
-                        label(cr, text, r.x, r.y + 4.0, r.w, 10.0, pango::Weight::Bold, theme::DIM, 0.9 * a);
+                    label(cr, text, r.x + 4.0, r.y + 10.0, r.w, 9.5, pango::Weight::Bold, theme::DIM, 0.9 * a);
+                }
+                RowItem::Message(text) => {
+                    label_center(cr, text, r.x, r.y + 13.0, r.w, 12.0, pango::Weight::Normal, theme::MUTED, 0.6 * a);
+                }
+                RowItem::Track(list, i) => {
+                    if let Some(t) = self.list_track(list, i) {
+                        let current = match list {
+                            List::Queue => i == self.index,
+                            _ => self.track.as_ref().is_some_and(|c| c.id == t.id),
+                        };
+                        let number = match list {
+                            List::Detail | List::Saved => Some(i + 1),
+                            _ => None,
+                        };
+                        self.track_row(cr, *r, t, hovered, current, number, a);
+                    }
+                }
+                RowItem::SearchColl(i) => {
+                    if let Some(c) = self.colls.get(i) {
+                        self.coll_row(cr, *r, &c.title, &c.subtitle, &c.art, c.kind, hovered, a);
+                    }
+                }
+                RowItem::HomeColl(i) => {
+                    if let Some(c) = self.home_colls.get(i) {
+                        self.coll_row(cr, *r, &c.title, &c.subtitle, &c.art, c.kind, hovered, a);
+                    }
+                }
+                RowItem::Mix(i) => {
+                    if let Some(c) = self.mixes.get(i) {
+                        self.coll_row(cr, *r, &c.title, &c.subtitle, &c.art, c.kind, hovered, a);
                     }
                 }
                 RowItem::Playlist(i) => {
                     if let Some(p) = self.playlists.get(i) {
-                        let hovered = self.hover == Some(Hit::Playlist(i));
-                        self.row_background(cr, r, hovered, a);
-                        icon(cr, Icon::Queue, r.x + 20.0, r.cy(), 16.0, self.accent.lighten(0.3), 0.85 * a);
-                        label(cr, &p.name, r.x + 42.0, r.y + 10.0, r.w - 130.0, 13.0, pango::Weight::Medium, theme::TEXT, 0.9 * a);
-                        label(cr, &format!("{} canciones", p.count), r.x + r.w - 116.0, r.y + 12.0, 74.0, 10.0, pango::Weight::Normal, theme::DIM, 0.8 * a);
+                        let sub = if p.remote.is_empty() {
+                            format!("{} canciones", p.count)
+                        } else if p.count == 0 {
+                            "YouTube Music · ábrela para cargarla".to_string()
+                        } else {
+                            format!("{} canciones · YouTube Music", p.count)
+                        };
+                        let kind = if p.remote.starts_with("MPRE") { CollKind::Album } else { CollKind::Playlist };
+                        self.coll_row(cr, *r, &p.name, &sub, &p.art, kind, hovered, a);
                     }
                 }
-                RowItem::AddTo(_) => {
-                    let hovered = self.hover.map(|h| matches!(h, Hit::AddTo(_))).unwrap_or(false);
-                    if hovered {
-                        cr.arc(r.cx(), r.cy(), 13.0, 0.0, std::f64::consts::TAU);
-                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
-                        cr.fill();
-                    }
-                    icon(cr, Icon::Plus, r.cx(), r.cy(), 12.0, theme::MUTED, 0.75 * a);
+                RowItem::Import => {
+                    let text = if self.importing { "Importando…" } else { "Importar de YouTube Music" };
+                    self.pill(cr, *r, Icon::Queue, text, hovered, false, a);
                 }
                 RowItem::NewPlaylist => {
-                    let hovered = self.hover == Some(Hit::NewPlaylist);
-                    rr(cr, r.x, r.y + 1.0, r.w, r.h - 2.0, 11.0);
-                    cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 0.075 } else { 0.035 } * a);
+                    self.pill(cr, *r, Icon::Plus, "Nueva lista", hovered, false, a);
+                }
+                RowItem::Back => {
+                    rr(cr, r.x, r.y, r.w, r.h, r.h / 2.0);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 0.10 } else { 0.05 } * a);
                     cr.fill();
-                    icon(cr, Icon::Plus, r.x + 20.0, r.cy(), 13.0, self.accent.lighten(0.3), 0.9 * a);
-                    label(cr, "Nueva lista", r.x + 42.0, r.y + 8.0, r.w - 60.0, 12.0, pango::Weight::Medium, theme::MUTED, 0.9 * a);
-                }
-                RowItem::Track(i) => {
-                    if let Some(t) = self.library.get(i) {
-                        let hovered = self.hover == Some(Hit::Track(i));
-                        self.track_row(cr, r, t, hovered, a, Some(i + 1));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn draw_search(&self, cr: &Context, content: Rect, a: f64) {
-        if self.searching {
-            icon(cr, Icon::Search, content.cx(), content.y + 140.0, 34.0, theme::DIM, 0.4 * a);
-            label_center(cr, "Buscando…", content.x, content.y + 178.0, content.w, 13.0, pango::Weight::Normal, theme::MUTED, 0.7 * a);
-            return;
-        }
-        if self.results.is_empty() {
-            icon(cr, Icon::Search, content.cx(), content.y + 120.0, 36.0, theme::DIM, 0.35 * a);
-            label_center(cr, "Busca cualquier canción de YouTube Music", content.x, content.y + 160.0, content.w, 13.0, pango::Weight::Normal, theme::MUTED, 0.65 * a);
-            label_center(cr, "Pulsa Enter para buscar · resultados con audio y vídeo", content.x, content.y + 184.0, content.w, 10.5, pango::Weight::Normal, theme::DIM, 0.5 * a);
-            return;
-        }
-        for (r, item) in self.rows(content) {
-            if let RowItem::Result(i) = item {
-                if let Some(t) = self.results.get(i) {
-                    let hovered = self.hover == Some(Hit::Result(i));
-                    self.track_row(cr, r, t, hovered, a, None);
-                }
-            }
-        }
-    }
-
-    fn draw_queue(&self, cr: &Context, content: Rect, a: f64) {
-        for (r, item) in self.rows(content) {
-            match item {
-                RowItem::Header(text) => {
-                    label_center(cr, text, content.x, content.y + 24.0, content.w, 12.0, pango::Weight::Normal, theme::DIM, 0.6 * a);
-                }
-                RowItem::QueueTrack(i) => {
-                    if let Some(t) = self.queue.get(i) {
-                        let hovered = self.hover == Some(Hit::QueueTrack(i));
-                        let current = i == self.index;
-                        self.track_row(cr, r, t, hovered, a, Some(i + 1));
-                        if current {
-                            rr(cr, r.x, r.y + 2.0, 2.5, r.h - 4.0, 1.25);
-                            set(cr, self.accent.lighten(0.2), 0.9 * a);
-                            cr.fill();
+                    icon(cr, Icon::ChevronLeft, r.x + 16.0, r.cy(), 13.0, theme::TEXT, 0.85 * a);
+                    label(cr, "Volver", r.x + 30.0, r.cy() - 8.0, r.w - 34.0, 11.5, pango::Weight::Medium, theme::TEXT, 0.85 * a);
+                    if let Some(d) = &self.detail {
+                        let art = Rect::new(r.x, r.y + 38.0, 92.0, 92.0 - 26.0);
+                        let art = Rect::new(art.x, art.y, art.h, art.h);
+                        let fallback = if d.kind == CollKind::Mix { Icon::Music } else { Icon::Queue };
+                        self.thumb_or_placeholder(cr, art, 12.0, &d.art, fallback, a);
+                        label(cr, &d.title, r.x + 108.0, r.y + 36.0, content.w - 116.0, 17.0, pango::Weight::Semibold, theme::TEXT, a);
+                        let mut sub = d.subtitle.clone();
+                        if !d.tracks.is_empty() && !sub.contains("canciones") {
+                            sub = format!("{sub} · {} canciones", d.tracks.len());
                         }
+                        label(cr, sub.trim_start_matches(" · "), r.x + 108.0, r.y + 58.0, content.w - 116.0, 10.5, pango::Weight::Normal, theme::MUTED, 0.7 * a);
                     }
                 }
+                RowItem::DetailPlay => self.pill(cr, *r, Icon::Play, "Reproducir", hovered, true, a),
+                RowItem::DetailShuffle => self.pill(cr, *r, Icon::Shuffle, "Aleatorio", hovered, false, a),
+                RowItem::DetailSave => self.pill(cr, *r, Icon::Plus, "Guardar", hovered, false, a),
                 _ => {}
             }
         }
+
+        // Pass 2: small action buttons, shown while their row is hovered.
+        for (r, item) in &rows {
+            if !visible(r) {
+                continue;
+            }
+            let (ic, danger) = match *item {
+                RowItem::Enqueue(..) => (Icon::PlayNext, false),
+                RowItem::Unsave(_) | RowItem::Dequeue(_) | RowItem::RemoveFromPlaylist(_) => (Icon::Close, false),
+                RowItem::AddTo(_) => (Icon::Plus, false),
+                RowItem::DeletePlaylist(pid) => (
+                    Icon::Close,
+                    self.confirm_delete.is_some_and(|(id, at)| id == pid && at.elapsed().as_secs() < 4),
+                ),
+                _ => continue,
+            };
+            let on_row = mouse_in && my >= r.y - 10.0 && my <= r.y + r.h + 10.0 && mx >= content.x;
+            if !on_row && !danger {
+                continue;
+            }
+            let hovered = row_hovered(r);
+            cr.arc(r.cx(), r.cy(), 15.0, 0.0, std::f64::consts::TAU);
+            if danger {
+                cr.set_source_rgba(0.85, 0.25, 0.22, 0.55 * a);
+            } else {
+                cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 0.16 } else { 0.07 } * a);
+            }
+            cr.fill();
+            icon(cr, ic, r.cx(), r.cy(), 13.0, theme::TEXT, if hovered { 0.95 } else { 0.7 } * a);
+        }
     }
 
-    fn track_row(&self, cr: &Context, r: Rect, t: &Track, hovered: bool, a: f64, index: Option<usize>) {
+    fn track_row(&self, cr: &Context, r: Rect, t: &Track, hovered: bool, current: bool, number: Option<usize>, a: f64) {
         self.row_background(cr, r, hovered, a);
-        let thumb = Rect::new(r.x + 8.0, r.y + (r.h - 34.0) / 2.0, 34.0, 34.0);
-        if let Some(surface) = &self.cover {
-            if self.track.as_ref().map(|x| x.id == t.id).unwrap_or(false) {
-                rounded_pic(cr, thumb, 9.0, surface);
-            } else {
-                placeholder_art(cr, thumb, 9.0, self.accent, a);
-            }
+        if current {
+            rr(cr, r.x, r.y + 4.0, r.w, r.h - 8.0, 12.0);
+            set(cr, self.accent, 0.10 * a);
+            cr.fill();
+            rr(cr, r.x, r.y + 8.0, 2.5, r.h - 16.0, 1.25);
+            set(cr, self.accent.lighten(0.2), 0.9 * a);
+            cr.fill();
+        }
+        let mut x = r.x + 8.0;
+        if let Some(n) = number {
+            label_center(cr, &format!("{n}"), x - 4.0, r.cy() - 7.0, 26.0, 9.5, pango::Weight::Normal, theme::DIM, 0.6 * a);
+            x += 24.0;
+        }
+        let thumb = Rect::new(x, r.y + (r.h - 36.0) / 2.0, 36.0, 36.0);
+        self.thumb_or_placeholder(cr, thumb, 8.0, &t.art, Icon::Music, a);
+        if current {
+            rr(cr, thumb.x, thumb.y, thumb.w, thumb.h, 8.0);
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.45 * a);
+            cr.fill();
+            icon(cr, if self.playing { Icon::Pause } else { Icon::Play }, thumb.cx(), thumb.cy(), 12.0, Rgb::new(1.0, 1.0, 1.0), 0.95 * a);
+        }
+
+        let text_x = thumb.x + thumb.w + 12.0;
+        let text_w = r.x + r.w - text_x - if hovered { 84.0 } else { 58.0 };
+        let title_color = if current { self.accent.lighten(0.45) } else { theme::TEXT };
+        label(cr, &t.title, text_x, r.y + 7.0, text_w, 12.5, pango::Weight::Medium, title_color, 0.92 * a);
+        let sub = if t.album.is_empty() || t.album == t.title {
+            t.subtitle()
         } else {
-            placeholder_art(cr, thumb, 9.0, self.accent, a);
-        }
-        rr(cr, thumb.x + 0.5, thumb.y + 0.5, thumb.w - 1.0, thumb.h - 1.0, 8.5);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
-        cr.set_line_width(1.0);
-        cr.stroke();
-
-        let is_current = self.track.as_ref().map(|x| x.id == t.id).unwrap_or(false);
-        if is_current {
-            icon(cr, Icon::Play, r.x + 20.0, r.cy(), 11.0, self.accent.lighten(0.35), 0.9 * a);
-        } else if let Some(i) = index {
-            label(cr, &format!("{i}"), r.x + 14.0, r.cy() - 7.0, 24.0, 9.5, pango::Weight::Normal, theme::DIM, 0.6 * a);
-        }
-
-        let text_x = r.x + 52.0;
-        label(cr, &t.title, text_x, r.y + 8.0, r.w - 140.0, 12.5, pango::Weight::Medium, theme::TEXT, 0.92 * a);
-        label(cr, &t.subtitle(), text_x, r.y + 25.0, r.w - 140.0, 10.5, pango::Weight::Normal, theme::MUTED, 0.62 * a);
-        if t.duration > 0.0 {
-            label(cr, &format_time(t.duration), r.x + r.w - 62.0, r.y + 14.0, 48.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
+            format!("{} · {}", t.subtitle(), t.album)
+        };
+        label(cr, &sub, text_x, r.y + 25.0, text_w, 10.5, pango::Weight::Normal, theme::MUTED, 0.62 * a);
+        if t.duration > 0.0 && !hovered {
+            label(cr, &format_time(t.duration), r.x + r.w - 50.0, r.y + 15.0, 44.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
         }
     }
 }

@@ -8,6 +8,7 @@ mod spotify;
 mod theme;
 mod ui;
 mod yt;
+mod ytm;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -52,6 +53,9 @@ enum Action {
         #[arg(long)]
         artist: Option<String>,
     },
+    /// Look up lyrics for a song and report what was found (diagnostics).
+    #[command(hide = true)]
+    Lyrics { title: String, artist: String, #[arg(default_value_t = 0.0)] duration: f64 },
     /// Open the search tab, optionally running a query.
     Search { query: Option<String> },
 }
@@ -140,6 +144,13 @@ fn main() {
         Action::Click { x, y } => send(Cmd::Click { x, y }),
         Action::Play { id, title, artist } => send(Cmd::Play { id, title, artist }),
         Action::Search { query } => send(Cmd::Search { query }),
+        Action::Lyrics { title, artist, duration } => {
+            let t = model::Track { title, artist, duration, ..Default::default() };
+            match lyrics::fetch(&t) {
+                Ok(l) => println!("{} · {} líneas", if l.synced { "SINCRONIZADA" } else { "solo texto" }, l.lines.len()),
+                Err(e) => println!("sin letra: {e}"),
+            }
+        }
     }
 }
 

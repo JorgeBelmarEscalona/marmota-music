@@ -47,6 +47,27 @@ pub struct Playlist {
     pub id: i64,
     pub name: String,
     pub count: i64,
+    /// YouTube Music browse id for imported / followed playlists.
+    pub remote: String,
+    pub art: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CollKind {
+    Album,
+    #[default]
+    Playlist,
+    Mix,
+}
+
+/// An album, playlist or mix that can be opened to list its songs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Collection {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub art: String,
+    pub kind: CollKind,
 }
 
 /// Live playback values published by the mpv thread.
@@ -112,7 +133,16 @@ pub enum Cmd {
 
 #[derive(Debug)]
 pub enum Event {
-    SearchDone(String, Vec<Track>),
+    SearchDone(String, Vec<Track>, Vec<Collection>),
+    HomeDone(Vec<Collection>, Vec<Track>),
+    /// (collection id, title, tracks)
+    CollectionDone(String, String, Vec<Track>),
+    /// (seed video id, tracks)
+    RadioDone(String, Vec<Track>),
+    ThumbDone(String, std::path::PathBuf),
+    ImportDone(Result<usize, String>),
+    /// (track id, music video id if one was found)
+    VideoFound(String, Option<String>),
     LyricsDone(String, Vec<LyricLine>, bool),
     CoverDone(String, std::path::PathBuf),
     Ended,
