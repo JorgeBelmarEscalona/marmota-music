@@ -89,7 +89,7 @@ fn build(synced: Option<String>, plain: Option<String>) -> Result<Lyrics> {
 fn client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(9))
-        .user_agent("MarmotaMusic/0.2 (https://github.com/marmota/marmota-music)")
+        .user_agent("MarmotaMusic/0.2 (https://github.com/JorgeBelmarEscalona/marmota-music)")
         .build()?)
 }
 

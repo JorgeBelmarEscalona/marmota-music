@@ -2,11 +2,15 @@
 
 Reproductor de música nativo para Omarchy/Hyprland: una barra flotante tipo
 *notch* en la parte inferior de la pantalla, con estética de vidrio, portada,
-letras sincronizadas y controles completos. Suena con **mpv** + **yt-dlp**
-(YouTube Music); Spotify queda para la siguiente fase.
+letras sincronizadas, vídeo dentro del notch y controles completos.
+Busca y reproduce desde **YouTube Music** y **Spotify**.
+
+![Vídeo y letra sincronizada](docs/video-letra.png)
+![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
 
 - **Abrir/cerrar:** `Super + Shift + M` (o `marmota-music toggle`)
-- Reemplaza a Orchard: el atajo y el botón de la barra ya apuntan aquí.
+- **Instalar:** `./install.sh` (ver [Instalar](#instalar))
+- Hecho en Rust + GTK4, pensado para gastar poco: ~1 % de CPU contraído.
 
 ## Uso
 
@@ -56,12 +60,12 @@ marmota-music search [texto]
 
 ## Integración con el escritorio
 
-- `~/.config/hypr/bindings.lua`: `SUPER + SHIFT + M` → `marmota-music toggle`.
-- `~/.config/hypr/autostart.lua`: arranca `marmota-music daemon` al iniciar sesión.
-- `~/.config/hypr/music.lua`: regla de capa `marmota-music` y ventana flotante
-  `marmota-video` (960×540, centrada) para el modo vídeo.
-- `~/.config/omarchy/shell.json`: el botón de la barra muestra la canción y abre
-  el notch (`~/.config/omarchy/bar/scripts/marmota-music-button`).
+`install.sh` agrega a Hyprland el atajo, el arranque automático y la regla de
+vidrio de la capa `marmota-music`.
+
+Opcional, para la barra de Omarchy: `extras/omarchy-bar-button.sh` muestra la
+canción actual (requiere `jq`). Cópialo a `~/.config/omarchy/bar/scripts/` y
+agrégalo como módulo con `"onClick": "marmota-music toggle"`.
 
 ## Instalar
 
