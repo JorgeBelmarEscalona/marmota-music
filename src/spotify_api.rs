@@ -62,17 +62,37 @@ fn token(c: &reqwest::blocking::Client) -> Result<String> {
 pub fn search(query: &str) -> Result<Vec<Track>> {
     let c = client()?;
     let tok = token(&c)?;
-    let resp = c
-        .get("https://api.spotify.com/v1/search")
-        .bearer_auth(tok)
-        .query(&[("q", query), ("type", "track"), ("limit", "20"), ("market", "CL")])
-        .send()?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("Spotify respondió {}", resp.status()));
+    // Apps in development mode may ask for at most 10 results per request,
+    // so fetch two pages.
+    let mut items: Vec<Value> = Vec::new();
+    for offset in ["0", "10"] {
+        let resp = c
+            .get("https://api.spotify.com/v1/search")
+            .bearer_auth(&tok)
+            .query(&[("q", query), ("type", "track"), ("limit", "10"), ("offset", offset), ("market", "CL")])
+            .send()?;
+        if !resp.status().is_success() {
+            if !items.is_empty() {
+                break;
+            }
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            return Err(anyhow!("Spotify respondió {status} {msg}"));
+        }
+        let v: Value = resp.json()?;
+        let page = v.pointer("/tracks/items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        let done = page.len() < 10;
+        items.extend(page);
+        if done {
+            break;
+        }
     }
-    let v: Value = resp.json()?;
     let mut out = Vec::new();
-    for item in v.pointer("/tracks/items").and_then(|i| i.as_array()).into_iter().flatten() {
+    for item in &items {
         let Some(id) = item.get("id").and_then(|i| i.as_str()) else { continue };
         let artist = item
             .get("artists")
