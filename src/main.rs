@@ -5,6 +5,7 @@ mod model;
 mod mpv;
 mod paths;
 mod rank;
+mod setup;
 mod spotify;
 mod spotify_api;
 mod theme;
@@ -55,6 +56,11 @@ enum Action {
         #[arg(long)]
         artist: Option<String>,
     },
+    /// Connect YouTube Music and Spotify step by step.
+    Setup,
+    /// Reload the library (after importing playlists from outside).
+    #[command(hide = true)]
+    Refresh,
     /// Look up lyrics for a song and report what was found (diagnostics).
     #[command(hide = true)]
     Lyrics { title: String, artist: String, #[arg(default_value_t = 0.0)] duration: f64 },
@@ -156,6 +162,11 @@ fn main() {
         Action::Click { x, y } => send(Cmd::Click { x, y }),
         Action::Play { id, title, artist } => send(Cmd::Play { id, title, artist }),
         Action::Search { query } => send(Cmd::Search { query }),
+        Action::Setup => setup::run(),
+        // Only nudge a running notch; never start one just for this.
+        Action::Refresh => {
+            let _ = request(&Cmd::Refresh);
+        }
         Action::SearchTest { query } => {
             let yt = ytm::search(&query).map(|r| r.0).unwrap_or_default();
             let sp = spotify_api::search(&query).unwrap_or_default();

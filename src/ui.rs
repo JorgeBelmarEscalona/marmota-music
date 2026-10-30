@@ -66,6 +66,8 @@ pub enum RowItem {
     DeletePlaylist(i64),
     NewPlaylist,
     Import,
+    /// Open the account assistant.
+    Connect,
     Back,
     DetailPlay,
     DetailShuffle,
@@ -240,6 +242,7 @@ pub struct App {
     pub sp_started: Instant,
     pub sp_was_playing: bool,
     pub spotify_search: bool,
+    pub accounts_ok: bool,
 
     pub playing: bool,
     pub pos: f64,
@@ -504,6 +507,7 @@ fn build(
         sp_started: Instant::now(),
         sp_was_playing: false,
         spotify_search: spotify_api::configured(),
+        accounts_ok: crate::setup::accounts_configured(),
         playing: false,
         pos: 0.0,
         dur: 0.0,
@@ -1033,7 +1037,8 @@ impl App {
                     }
                     if !self.spotify_search {
                         y += 4.0;
-                        message(&mut out, &mut y, "Para buscar también en Spotify, configura tu app (ver README)");
+                        out.push((Rect::new(x, y, w, 40.0), RowItem::Connect));
+                        y += 48.0;
                     }
                     if self.results.len() > top {
                         y += 6.0;
@@ -1373,7 +1378,14 @@ impl App {
                 }
             }
             RowItem::NewPlaylist => self.new_playlist(),
-            RowItem::Import => self.import_account(),
+            RowItem::Import => {
+                if self.accounts_ok {
+                    self.import_account();
+                } else {
+                    self.open_setup();
+                }
+            }
+            RowItem::Connect => self.open_setup(),
             RowItem::Back => self.close_detail(),
             RowItem::DetailPlay | RowItem::DetailShuffle => {
                 if let Some(d) = self.detail.clone() {
@@ -2181,6 +2193,31 @@ impl App {
         }
     }
 
+    /// Run `marmota-music setup` in a floating terminal.
+    fn open_setup(&mut self) {
+        let omarchy = "omarchy-launch-floating-terminal-with-presentation";
+        let has_omarchy = std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {omarchy}")])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let spawned = if has_omarchy {
+            std::process::Command::new(omarchy).arg("marmota-music setup").spawn()
+        } else {
+            std::process::Command::new("xdg-terminal-exec")
+                .args(["marmota-music", "setup"])
+                .env("MM_SETUP_WAIT", "1")
+                .spawn()
+        };
+        match spawned {
+            Ok(_) => {
+                self.set_status("Sigue los pasos en la terminal");
+                self.collapse();
+            }
+            Err(e) => self.set_status(&format!("No pude abrir la terminal: {e}")),
+        }
+    }
+
     fn import_account(&mut self) {
         if self.importing {
             return;
@@ -2222,6 +2259,7 @@ impl App {
     }
 
     fn refresh_library(&mut self) {
+        self.accounts_ok = crate::setup::accounts_configured();
         self.library = self.db.library();
         self.history = self.db.history(25);
         self.playlists = self.db.playlists();
@@ -2419,6 +2457,12 @@ impl App {
                 self.on_press((x + ox) * self.ui_scale, (y + oy) * self.ui_scale)
             }
             Cmd::Status => {}
+            Cmd::Refresh => {
+                self.refresh_library();
+                self.spotify_search = spotify_api::configured();
+                self.searched.clear();
+                self.set_status("Cuentas actualizadas");
+            }
         }
     }
 

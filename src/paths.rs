@@ -56,6 +56,19 @@ pub fn config() -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+/// Set one key in the config file, keeping the rest.
+pub fn set_config(key: &str, value: serde_json::Value) {
+    let mut cfg = config();
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+    let path = config_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+}
+
 /// Browser whose YouTube session yt-dlp borrows to import the user's
 /// playlists (`--cookies-from-browser` syntax). Defaults to the system
 /// browser on this machine (Zen, a Firefox fork).

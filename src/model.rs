@@ -138,6 +138,7 @@ pub enum Cmd {
     ToggleVideo,
     Click { x: f64, y: f64 },
     Status,
+    Refresh,
 }
 
 #[derive(Debug)]

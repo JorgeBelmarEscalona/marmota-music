@@ -1165,8 +1165,17 @@ impl App {
                         self.coll_row(cr, *r, &p.name, &sub, &p.art, kind, hovered, a);
                     }
                 }
+                RowItem::Connect => {
+                    self.pill(cr, *r, Icon::Spotify, "Conectar Spotify para buscar también allí", hovered, false, a);
+                }
                 RowItem::Import => {
-                    let text = if self.importing { "Importando…" } else { "Importar de YouTube Music" };
+                    let text = if self.importing {
+                        "Importando…"
+                    } else if !self.accounts_ok {
+                        "Conectar cuentas"
+                    } else {
+                        "Importar de YouTube Music"
+                    };
                     self.pill(cr, *r, Icon::Queue, text, hovered, false, a);
                 }
                 RowItem::NewPlaylist => {

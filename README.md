@@ -63,15 +63,37 @@ marmota-music search [texto]
 - `~/.config/omarchy/shell.json`: el botón de la barra muestra la canción y abre
   el notch (`~/.config/omarchy/bar/scripts/marmota-music-button`).
 
-## Compilar / instalar
+## Instalar
 
 ```bash
-cd ~/Projects/marmota-music
-cargo build --release
-install -Dm755 target/release/marmota-music ~/.local/bin/marmota-music
+git clone https://github.com/JorgeBelmarEscalona/marmota-music
+cd marmota-music
+./install.sh
 ```
 
-Dependencias de sistema: `gtk4`, `gtk4-layer-shell`, `mpv`, `yt-dlp`.
+El instalador:
+
+1. instala lo que falte (`gtk4`, `gtk4-layer-shell`, `mpv`, `yt-dlp`, `rust`);
+2. compila e instala `~/.local/bin/marmota-music`;
+3. agrega a Hyprland el atajo `Super + Shift + M`, el arranque automático y
+   la regla de vidrio (si ya existen, no toca nada);
+4. arranca el notch;
+5. **la primera vez** abre el asistente de cuentas. Si ya estaba configurado,
+   lo omite.
+
+### Conectar cuentas
+
+`marmota-music setup` (o el botón *Conectar cuentas* de la Biblioteca)
+pregunta paso a paso:
+
+- **YouTube Music:** ¿tienes cuenta? → elige el navegador donde tienes la
+  sesión iniciada → importa tus listas y tus «Me gusta».
+- **Spotify:** ¿tienes cuenta? → abre la página para crear la app de
+  búsqueda y valida las claves → si es Premium, instala `spotifyd`, abre el
+  inicio de sesión y lo deja arrancando solo.
+
+Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
+Para repetirlo: `marmota-music setup` o `./install.sh --setup`.
 
 ## Spotify
 
