@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use crate::model::{Event, Playback};
 
 /// Size of the software-rendered video frame. The notch paints it scaled.
-pub const VIDEO_W: i32 = 768;
-pub const VIDEO_H: i32 = 432;
+pub const VIDEO_W: i32 = 640;
+pub const VIDEO_H: i32 = 360;
 
 mod ffi {
     use super::*;
@@ -309,7 +309,7 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                         // mpv resolved the track as audio-only; reload it with a
                         // video-capable format and pick up where we left off.
                         let pos = shared.lock().map(|s| s.pos).unwrap_or(0.0);
-                        send(&mut stream, &mut rid, json!(["set_property", "ytdl-format", "bestvideo[height<=720][vcodec!*=av01]+bestaudio/best[height<=720]/best"]));
+                        send(&mut stream, &mut rid, json!(["set_property", "ytdl-format", "bestvideo[height<=480][vcodec!*=av01]+bestaudio/best[height<=480]/best"]));
                         send(&mut stream, &mut rid, json!(["set_property", "vid", "auto"]));
                         resume_on_load = Some(pos);
                         ended_sent = false;

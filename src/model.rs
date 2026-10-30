@@ -148,14 +148,14 @@ pub enum Event {
     CollectionDone(String, String, Vec<Track>),
     /// (seed video id, tracks)
     RadioDone(String, Vec<Track>),
-    ThumbDone(String, std::path::PathBuf),
+    ThumbDone(String, Option<Pixels>),
     ImportDone(Result<usize, String>),
     /// (track id, music video id if one was found)
     VideoFound(String, Option<String>),
     /// A Spotify song replaced by its YouTube Music twin: (spotify id, twin).
     Substitute(String, Option<Track>),
     LyricsDone(String, Vec<LyricLine>, bool),
-    CoverDone(String, std::path::PathBuf),
+    CoverDone(String, Option<Pixels>),
     Ended,
     Cmd(Cmd),
     Error(String),
@@ -182,4 +182,13 @@ impl Rect {
     pub fn cy(&self) -> f64 {
         self.y + self.h / 2.0
     }
+}
+
+/// A decoded image (premultiplied BGRA, stride = w * 4). Decoding happens on
+/// worker threads; the UI thread only copies it into a Cairo surface.
+#[derive(Debug)]
+pub struct Pixels {
+    pub w: u32,
+    pub h: u32,
+    pub data: Vec<u8>,
 }

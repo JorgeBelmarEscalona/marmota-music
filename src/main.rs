@@ -113,6 +113,13 @@ fn send(cmd: Cmd) {
 }
 
 fn main() {
+    // Everything is painted with Cairo on the CPU, so GTK's Cairo renderer
+    // skips the GPU upload: fewer dropped frames while animating and ~75 MB
+    // less memory than the Vulkan default. MM_RENDERER overrides it.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        let r = std::env::var("MM_RENDERER").unwrap_or_else(|_| "cairo".into());
+        std::env::set_var("GSK_RENDERER", r);
+    }
     paths::ensure_dirs();
     let cli = Cli::parse();
     let action = cli.cmd.unwrap_or(Action::Daemon);

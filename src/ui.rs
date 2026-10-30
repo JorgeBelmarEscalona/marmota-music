@@ -270,6 +270,9 @@ pub struct App {
     pub lyrics_synced: bool,
     pub lyrics_state: u8, // 0 idle, 1 loading, 2 ready, 3 none
     pub lyric_scroll: f64,
+    pub lyric_from: f64,
+    pub lyric_to: f64,
+    pub lyric_t0: Instant,
     pub list_scroll: f64,
     pub lyric_idx: usize,
 
@@ -296,6 +299,7 @@ pub struct App {
 
     pub accent: Rgb,
     pub cover: Option<cairo::ImageSurface>,
+    pub cover_blur: Option<cairo::ImageSurface>,
     pub cover_key: String,
     pub source: Source,
     pub spotify: Spotify,
@@ -310,6 +314,7 @@ pub struct App {
     pub width: f64,
     pub height: f64,
     pub ui_scale: f64,
+    pub input_rect: (i32, i32, i32, i32),
     pub dirty: bool,
     pub last_pos: f64,
 }
@@ -372,7 +377,11 @@ fn thumb_workers(events: Sender<Event>) -> Sender<String> {
                         continue;
                     }
                 }
-                let _ = events.send(Event::ThumbDone(url, path));
+                let px = decode_pixels(&path, 112);
+                if px.is_none() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                let _ = events.send(Event::ThumbDone(url, px));
             }
         });
     }
@@ -517,6 +526,9 @@ fn build(
         lyrics_synced: false,
         lyrics_state: 0,
         lyric_scroll: 0.0,
+        lyric_from: 0.0,
+        lyric_to: 0.0,
+        lyric_t0: Instant::now(),
         list_scroll: 0.0,
         lyric_idx: 0,
         library: Vec::new(),
@@ -539,6 +551,7 @@ fn build(
         thumb_tx,
         accent: theme::ACCENT_FALLBACK,
         cover: None,
+        cover_blur: None,
         cover_key: String::new(),
         source: Source::YouTube,
         spotify: Spotify::start(),
@@ -552,6 +565,7 @@ fn build(
         width: COLLAPSED_W,
         height: COLLAPSED_H,
         ui_scale: 1.0,
+        input_rect: (0, 0, 0, 0),
         dirty: true,
         last_pos: -1.0,
     };
@@ -562,9 +576,18 @@ fn build(
     // --- draw -------------------------------------------------------------
     {
         let a = app_cell.clone();
-        area.set_draw_func(move |_area, cr, _w, _h| {
+        area.set_draw_func(move |_area, cr, sw, sh| {
             let s = a.borrow();
+            let t0 = Instant::now();
+            // The window keeps the expanded size; the pill is painted inside
+            // it (bottom-centred) at its animated size. Resizing the surface
+            // every frame lagged a frame behind, jittered and reallocated
+            // buffers on each step.
+            let _ = (sw, sh);
             s.draw(cr, s.width, s.height);
+            if std::env::var_os("MM_PROFILE").is_some() {
+                eprintln!("draw {:.1}ms anim={:.2} tab={:?}", t0.elapsed().as_secs_f64() * 1000.0, s.anim, s.tab);
+            }
         });
     }
 
@@ -607,6 +630,8 @@ fn build(
                 if s.tab == Tab::Lyrics {
                     s.lyric_scroll += dy * 40.0;
                     s.lyric_manual = Instant::now();
+                    // Resume auto-follow with a fresh tween afterwards.
+                    s.lyric_to = f64::MIN;
                     s.dirty = true;
                 } else {
                     s.scroll_list(dy);
@@ -726,9 +751,36 @@ fn build(
     // --- ticker -----------------------------------------------------------
     {
         let a = app_cell.clone();
+        // While something animates, tick from GTK's frame clock so every
+        // displayed frame gets exactly one update (vsync-aligned).
+        let fa = app_cell.clone();
+        area.add_tick_callback(move |_, _| {
+            if let Ok(mut s) = fa.try_borrow_mut() {
+                if s.animating {
+                    s.tick();
+                }
+            }
+            glib::ControlFlow::Continue
+        });
         glib::timeout_add_local(Duration::from_millis(16), move || {
             if let Ok(mut s) = a.try_borrow_mut() {
+                if s.animating && s.area.is_mapped() {
+                    return glib::ControlFlow::Continue;
+                }
+                let t0 = Instant::now();
                 s.tick();
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if s.animating && std::env::var_os("MM_PROFILE").is_some() {
+                    eprintln!(
+                        "anim {:.2} want {:.0}x{:.0} window {}x{} area {}x{} entry={}",
+                        s.anim, s.width * s.ui_scale, s.height * s.ui_scale,
+                        s.window.width(), s.window.height(), s.area.width(), s.area.height(),
+                        WidgetExt::is_visible(&s.entry)
+                    );
+                }
+                if ms > 4.0 && std::env::var_os("MM_PROFILE").is_some() {
+                    eprintln!("tick {ms:.1}ms");
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -750,7 +802,7 @@ impl App {
     }
 
     pub(crate) fn collapsed_layout(&self) -> Layout {
-        let w = self.width;
+        let (w, _) = self.surface_size();
         let mut l = Layout::default();
         l.collapsed = true;
         l.art = Rect::new(14.0, 15.0, 46.0, 46.0);
@@ -764,13 +816,46 @@ impl App {
         l
     }
 
+    /// Size of the surface as last painted (falls back to the requested
+    /// size before the first frame).
+    pub fn surface_size(&self) -> (f64, f64) {
+        (self.width, self.height)
+    }
+
+    /// Top-left of the pill inside the fixed-size window (logical px).
+    pub fn origin(&self) -> (f64, f64) {
+        ((EXPANDED_W - self.width) / 2.0, EXPANDED_H - self.height)
+    }
+
+    /// Only the visible pill takes clicks; the transparent rest of the
+    /// window lets them through to whatever is behind.
+    fn sync_input_region(&mut self) {
+        let k = self.ui_scale;
+        let (ox, oy) = self.origin();
+        let rect = (
+            (ox * k).floor() as i32,
+            (oy * k).floor() as i32,
+            (self.width * k).ceil() as i32,
+            (self.height * k).ceil() as i32,
+        );
+        if rect == self.input_rect {
+            return;
+        }
+        if let Some(surface) = self.window.surface() {
+            let region = cairo::Region::create_rectangle(&cairo::RectangleInt::new(
+                rect.0, rect.1, rect.2, rect.3,
+            ));
+            surface.set_input_region(Some(&region));
+            self.input_rect = rect;
+        }
+    }
+
     pub fn showing_video(&self) -> bool {
         self.video && self.has_video && self.video_surface.is_some()
     }
 
     pub(crate) fn expanded_layout(&self) -> Layout {
-        let w = self.width;
-        let h = self.height;
+        let (w, h) = self.surface_size();
         let mut l = Layout::default();
         l.cover = Rect::new(30.0, 30.0, 218.0, 218.0);
         l.title = Rect::new(30.0, 266.0, 340.0, 38.0);
@@ -1031,7 +1116,8 @@ impl App {
     // ------------------------------------------------------------- input
     fn on_motion(&mut self, x: f64, y: f64) {
         let k = self.ui_scale.max(0.1);
-        let (x, y) = (x / k, y / k);
+        let (ox, oy) = self.origin();
+        let (x, y) = (x / k - ox, y / k - oy);
         self.mouse = (x, y);
         let l = self.layout();
         let mut hit = l.hit(x, y);
@@ -1072,7 +1158,11 @@ impl App {
 
     fn on_press(&mut self, x: f64, y: f64) {
         let k = self.ui_scale.max(0.1);
-        let (x, y) = (x / k, y / k);
+        let (ox, oy) = self.origin();
+        let (x, y) = (x / k - ox, y / k - oy);
+        if x < 0.0 || y < 0.0 || x > self.width || y > self.height {
+            return;
+        }
         self.mouse = (x, y);
         let l = self.layout();
         if l.collapsed {
@@ -1767,27 +1857,39 @@ impl App {
     fn start_cover(&mut self, t: &Track) {
         self.cover_key = t.id.clone();
         self.cover = None;
-        let path = paths::art_path(&t.id);
-        if path.exists() {
-            self.apply_cover(&t.id, &path);
-            return;
-        }
+        self.cover_blur = None;
         let tx = self.tx.clone();
         let id = t.id.clone();
         let art = t.art.clone();
+        // Download and decode off the UI thread: a 1280 px JPEG takes long
+        // enough to drop frames.
         std::thread::spawn(move || {
-            if let Ok(path) = yt::download_cover(&id, &art) {
-                let _ = tx.send(Event::CoverDone(id, path));
+            let path = paths::art_path(&id);
+            let path = if path.exists() { Ok(path) } else { yt::download_cover(&id, &art) };
+            if let Ok(path) = path {
+                let _ = tx.send(Event::CoverDone(id, decode_pixels(&path, 640)));
             }
         });
     }
 
-    fn apply_cover(&mut self, id: &str, path: &std::path::Path) {
+    fn apply_cover(&mut self, id: &str, px: Option<Pixels>) {
         if self.track.as_ref().map(|t| t.id.as_str()) != Some(id) {
             return;
         }
-        if let Some(mut surface) = decode_surface(path, 0) {
+        if let Some(mut surface) = px.as_ref().and_then(to_surface) {
             self.accent = theme::accent_from_surface(&mut surface);
+            // The glass backdrop only needs a 12 px version; make it once
+            // instead of shrinking the full cover every frame.
+            self.cover_blur = cairo::ImageSurface::create(cairo::Format::ARgb32, 12, 12)
+                .ok()
+                .and_then(|small| {
+                    let cr = cairo::Context::new(&small).ok()?;
+                    cr.scale(12.0 / surface.width() as f64, 12.0 / surface.height() as f64);
+                    cr.set_source_surface(&surface, 0.0, 0.0).ok()?;
+                    cr.paint().ok()?;
+                    drop(cr);
+                    Some(small)
+                });
             self.cover = Some(surface);
             self.dirty = true;
         }
@@ -1875,8 +1977,9 @@ impl App {
         if want {
             let l = self.layout();
             let k = self.ui_scale;
-            self.entry.set_margin_start((l.entry.x * k).round() as i32);
-            self.entry.set_margin_top((l.entry.y * k).round() as i32);
+            let (ox, oy) = self.origin();
+            self.entry.set_margin_start(((l.entry.x + ox) * k).round() as i32);
+            self.entry.set_margin_top(((l.entry.y + oy) * k).round() as i32);
             self.entry
                 .set_size_request((l.entry.w * k).round() as i32, (l.entry.h * k).round() as i32);
         }
@@ -2214,11 +2317,8 @@ impl App {
                 }
                 self.dirty = true;
             }
-            Event::ThumbDone(url, path) => {
-                let surf = decode_surface(&path, 112);
-                if surf.is_none() {
-                    let _ = std::fs::remove_file(&path);
-                }
+            Event::ThumbDone(url, px) => {
+                let surf = px.as_ref().and_then(to_surface);
                 self.thumbs.borrow_mut().insert(url, surf);
                 self.dirty = true;
             }
@@ -2261,8 +2361,8 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Event::CoverDone(id, path) => {
-                self.apply_cover(&id, &path);
+            Event::CoverDone(id, px) => {
+                self.apply_cover(&id, px);
             }
             Event::Ended => {
                 if self.repeat == Repeat::One {
@@ -2314,7 +2414,10 @@ impl App {
                 self.app.quit();
             }
             Cmd::ToggleVideo => self.set_video(!self.video),
-            Cmd::Click { x, y } => self.on_press(x * self.ui_scale, y * self.ui_scale),
+            Cmd::Click { x, y } => {
+                let (ox, oy) = self.origin();
+                self.on_press((x + ox) * self.ui_scale, (y + oy) * self.ui_scale)
+            }
             Cmd::Status => {}
         }
     }
@@ -2354,9 +2457,10 @@ impl App {
     fn sync_size(&mut self) {
         let k = self.ui_scale;
         self.window.set_default_size(
-            (self.width * k).round() as i32,
-            (self.height * k).round() as i32,
+            (EXPANDED_W * k).round() as i32,
+            (EXPANDED_H * k).round() as i32,
         );
+        self.sync_input_region();
     }
 
     /// Focused output as reported by Hyprland: connector, logical origin and
@@ -2441,6 +2545,9 @@ impl App {
         self.hiding = false;
         self.place();
         self.window.present();
+        // A (re)mapped surface starts with a full input region.
+        self.input_rect = (-1, -1, -1, -1);
+        self.sync_input_region();
         self.expanded = true;
         self.dirty = true;
         if self.anim < 0.999 {
@@ -2687,10 +2794,19 @@ impl App {
             }
             let lr = self.layout().lyrics;
             if lr.h > 0.0 && self.lyric_manual.elapsed().as_secs() > 4 {
+                // Fixed-length tween (~0.3 s) to the current line. The old
+                // exponential approach took ~1.4 s per line, so the notch was
+                // repainting most of the time a song played.
                 let target = 12.0 + idx as f64 * 46.0 + 23.0 - lr.h / 2.0;
-                let delta = target - self.lyric_scroll;
-                if delta.abs() > 0.5 {
-                    self.lyric_scroll += delta * 0.10;
+                if (target - self.lyric_to).abs() > 0.5 {
+                    self.lyric_from = self.lyric_scroll;
+                    self.lyric_to = target;
+                    self.lyric_t0 = Instant::now();
+                }
+                if (self.lyric_scroll - self.lyric_to).abs() > 0.01 {
+                    let t = (self.lyric_t0.elapsed().as_secs_f64() / 0.32).min(1.0);
+                    let e = 1.0 - (1.0 - t).powi(3);
+                    self.lyric_scroll = self.lyric_from + (self.lyric_to - self.lyric_from) * e;
                     self.dirty = true;
                 }
             }
@@ -2745,9 +2861,9 @@ fn shuffle_vec<T>(v: &mut [T]) {
     }
 }
 
-/// Decode an image into a Cairo surface; `max` > 0 downsizes it first (list
-/// thumbnails), keeping memory and paint cost low.
-fn decode_surface(path: &std::path::Path, max: u32) -> Option<cairo::ImageSurface> {
+/// Decode an image file into premultiplied BGRA, downsized to fit `max`.
+/// Runs on worker threads.
+fn decode_pixels(path: &std::path::Path, max: u32) -> Option<Pixels> {
     let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     let mut img = reader.decode().ok()?;
     if max > 0 && (img.width() > max || img.height() > max) {
@@ -2758,20 +2874,26 @@ fn decode_surface(path: &std::path::Path, max: u32) -> Option<cairo::ImageSurfac
     if w == 0 || h == 0 {
         return None;
     }
-    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32).ok()?;
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for p in img.pixels() {
+        let a = p[3] as u32;
+        data.push((p[2] as u32 * a / 255) as u8);
+        data.push((p[1] as u32 * a / 255) as u8);
+        data.push((p[0] as u32 * a / 255) as u8);
+        data.push(p[3]);
+    }
+    Some(Pixels { w, h, data })
+}
+
+fn to_surface(px: &Pixels) -> Option<cairo::ImageSurface> {
+    let mut surface =
+        cairo::ImageSurface::create(cairo::Format::ARgb32, px.w as i32, px.h as i32).ok()?;
     let stride = surface.stride() as usize;
+    let row = (px.w * 4) as usize;
     {
         let mut data = surface.data().ok()?;
-        for (y, row) in img.rows().enumerate() {
-            for (x, p) in row.enumerate() {
-                let i = y * stride + x * 4;
-                let a = p[3] as u32;
-                // Cairo wants premultiplied BGRA.
-                data[i] = (p[2] as u32 * a / 255) as u8;
-                data[i + 1] = (p[1] as u32 * a / 255) as u8;
-                data[i + 2] = (p[0] as u32 * a / 255) as u8;
-                data[i + 3] = p[3];
-            }
+        for y in 0..px.h as usize {
+            data[y * stride..y * stride + row].copy_from_slice(&px.data[y * row..(y + 1) * row]);
         }
     }
     Some(surface)

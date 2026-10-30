@@ -141,15 +141,22 @@ fn blurred_pic(cr: &Context, r: Rect, radius: f64, surf: &ImageSurface, alpha: f
         return;
     }
     let small = 12;
-    let Ok(tmp) = ImageSurface::create(cairo::Format::ARgb32, small, small) else {
-        return;
+    // Already tiny (the cached backdrop): use it as is.
+    let tmp = if sw <= 16.0 && sh <= 16.0 {
+        surf.clone()
+    } else {
+        let Ok(tmp) = ImageSurface::create(cairo::Format::ARgb32, small, small) else {
+            return;
+        };
+        {
+            let Ok(tcr) = Context::new(&tmp) else { return };
+            tcr.scale(small as f64 / sw, small as f64 / sh);
+            let _ = tcr.set_source_surface(surf, 0.0, 0.0);
+            let _ = tcr.paint();
+        }
+        tmp
     };
-    {
-        let Ok(tcr) = Context::new(&tmp) else { return };
-        tcr.scale(small as f64 / sw, small as f64 / sh);
-        let _ = tcr.set_source_surface(surf, 0.0, 0.0);
-        let _ = tcr.paint();
-    }
+    let small = tmp.width();
 
     let _ = cr.save();
     rr(cr, r.x, r.y, r.w, r.h, radius);
@@ -518,8 +525,10 @@ impl App {
         if k > 0.0 && (k - 1.0).abs() > 0.001 {
             cr.scale(k, k);
         }
+        let (ox, oy) = self.origin();
+        cr.translate(ox, oy);
         let radius = 37.0 + (30.0 - 37.0) * self.anim;
-        glass(cr, w, h, radius, self.accent, self.cover.as_ref());
+        glass(cr, w, h, radius, self.accent, self.cover_blur.as_ref());
 
         if self.anim < 0.55 {
             let a = (1.0 - self.anim / 0.55).clamp(0.0, 1.0);
