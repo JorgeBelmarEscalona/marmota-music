@@ -402,6 +402,42 @@ fn icon(cr: &Context, kind: Icon, cx: f64, cy: f64, s: f64, color: Rgb, alpha: f
     let _ = cr.restore();
 }
 
+/// Tiny platform mark: YouTube Music (red disc, ring and play) or Spotify
+/// (green disc with three waves).
+fn platform_badge(cr: &Context, cx: f64, cy: f64, spotify: bool, video: bool, a: f64) {
+    let r = 8.0;
+    let _ = cr.save();
+    cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
+    if spotify {
+        cr.set_source_rgba(0.12, 0.84, 0.38, 0.92 * a);
+        cr.fill();
+        cr.set_source_rgba(0.04, 0.04, 0.04, 0.95 * a);
+        cr.set_line_cap(LineCap::Round);
+        for (i, w) in [(0, 1.6), (1, 1.35), (2, 1.1)] {
+            let half = r * (0.58 - 0.09 * i as f64);
+            let y = cy - r * 0.30 + i as f64 * r * 0.32;
+            cr.set_line_width(w);
+            cr.move_to(cx - half, y);
+            cr.curve_to(cx - half * 0.3, y - r * 0.22, cx + half * 0.3, y - r * 0.22, cx + half, y + r * 0.06);
+            cr.stroke();
+        }
+    } else {
+        cr.set_source_rgba(1.0, 0.0, 0.2, 0.88 * a);
+        cr.fill();
+        cr.arc(cx, cy, r * 0.56, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95 * a);
+        cr.set_line_width(1.0);
+        cr.stroke();
+        cr.move_to(cx - r * 0.17, cy - r * 0.27);
+        cr.line_to(cx + r * 0.29, cy);
+        cr.line_to(cx - r * 0.17, cy + r * 0.27);
+        cr.close_path();
+        cr.fill();
+    }
+    let _ = video;
+    let _ = cr.restore();
+}
+
 fn circle_button(cr: &Context, r: Rect, hovered: bool, alpha: f64) {
     if hovered {
         cr.arc(r.cx(), r.cy(), r.w / 2.0, 0.0, std::f64::consts::TAU);
@@ -1209,7 +1245,7 @@ impl App {
         }
 
         let text_x = thumb.x + thumb.w + 12.0;
-        let text_w = r.x + r.w - text_x - if hovered { 84.0 } else { 58.0 };
+        let text_w = r.x + r.w - text_x - if hovered { 124.0 } else { 90.0 };
         let title_color = if current { self.accent.lighten(0.45) } else { theme::TEXT };
         label(cr, &t.title, text_x, r.y + 7.0, text_w, 12.5, pango::Weight::Medium, title_color, 0.92 * a);
         let sub = if t.album.is_empty() || t.album == t.title {
@@ -1218,8 +1254,9 @@ impl App {
             format!("{} · {}", t.subtitle(), t.album)
         };
         label(cr, &sub, text_x, r.y + 25.0, text_w, 10.5, pango::Weight::Normal, theme::MUTED, 0.62 * a);
+        platform_badge(cr, r.x + r.w - 20.0, r.cy(), t.is_spotify(), t.video, a);
         if t.duration > 0.0 && !hovered {
-            label(cr, &format_time(t.duration), r.x + r.w - 50.0, r.y + 15.0, 44.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
+            label(cr, &format_time(t.duration), r.x + r.w - 80.0, r.y + 15.0, 44.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
         }
     }
 }

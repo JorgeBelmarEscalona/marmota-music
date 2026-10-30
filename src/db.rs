@@ -16,6 +16,7 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
         duration: row.get(4)?,
         art: row.get(5)?,
         source: row.get(6)?,
+        ..Default::default()
     })
 }
 

@@ -16,7 +16,7 @@ use crate::mpv::{self, Mpv};
 use crate::paths;
 use crate::spotify::{self, Cmd as SpotifyCmd, Spotify};
 use crate::theme::{self, Rgb};
-use crate::{yt, ytm};
+use crate::{rank, spotify_api, yt, ytm};
 
 pub const COLLAPSED_W: f64 = 664.0;
 pub const COLLAPSED_H: f64 = 74.0;
@@ -234,6 +234,13 @@ pub struct App {
     pub radio_loading: bool,
     pub radio_waiting: bool,
 
+    /// The current Spotify track was started from our queue, so we decide
+    /// what plays next (instead of Spotify's own autoplay).
+    pub spotify_queue: bool,
+    pub sp_started: Instant,
+    pub sp_was_playing: bool,
+    pub spotify_search: bool,
+
     pub playing: bool,
     pub pos: f64,
     pub dur: f64,
@@ -444,6 +451,7 @@ fn build(
     entry.set_halign(gtk::Align::Start);
     entry.set_valign(gtk::Align::Start);
     entry.set_size_request(430, 38);
+    entry.set_primary_icon_name(Some("system-search-symbolic"));
 
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&area));
@@ -483,6 +491,10 @@ fn build(
         radio_seed: String::new(),
         radio_loading: false,
         radio_waiting: false,
+        spotify_queue: false,
+        sp_started: Instant::now(),
+        sp_was_playing: false,
+        spotify_search: spotify_api::configured(),
         playing: false,
         pos: 0.0,
         dur: 0.0,
@@ -780,12 +792,13 @@ impl App {
             Rect::new(664.0, 28.0, 100.0, 36.0),
             Rect::new(776.0, 28.0, 84.0, 36.0),
         ];
-        l.entry = Rect::new(430.0, 84.0, w - 458.0, 38.0);
+        // The entry lines up with the content pane's edges and sits clear of it.
+        l.entry = Rect::new(420.0, 80.0, w - 438.0, 40.0);
         l.content = Rect::new(430.0, 84.0, w - 458.0, h - 112.0);
         let entry_visible = self.entry_mode != EntryMode::Hidden
             && !(self.tab == Tab::Search && self.detail_here());
         if entry_visible {
-            l.content = Rect::new(430.0, 134.0, w - 458.0, h - 162.0);
+            l.content = Rect::new(430.0, 150.0, w - 458.0, h - 178.0);
         }
         l.lyrics = l.content;
         if self.tab == Tab::Lyrics && self.showing_video() {
@@ -840,7 +853,7 @@ impl App {
         // A track row with up to two small action buttons on the right.
         let track = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, item: RowItem, actions: &[RowItem]| {
             let r = Rect::new(x, *y, w, TRACK_ROW - 4.0);
-            let mut bx = r.x + r.w - 38.0;
+            let mut bx = r.x + r.w - 72.0;
             for a in actions {
                 out.push((Rect::new(bx, r.y + 7.0, 32.0, 32.0), *a));
                 bx -= 36.0;
@@ -932,6 +945,10 @@ impl App {
                         for i in 0..self.colls.len() {
                             coll(&mut out, &mut y, RowItem::SearchColl(i), &[]);
                         }
+                    }
+                    if !self.spotify_search {
+                        y += 4.0;
+                        message(&mut out, &mut y, "Para buscar también en Spotify, configura tu app (ver README)");
                     }
                     if self.results.len() > top {
                         y += 6.0;
@@ -1438,6 +1455,14 @@ impl App {
             return;
         }
         let key = spotify_key(&sp.track_id);
+        if self.spotify_queue && key != self.spotify_seen && self.sp_started.elapsed() < Duration::from_secs(5) {
+            // Still showing the previous song while ours loads.
+            return;
+        }
+        if self.spotify_queue && key != self.spotify_seen {
+            // Spotify moved on by itself (or from the phone): follow it.
+            self.spotify_queue = false;
+        }
         if key == self.spotify_seen {
             if self.dur <= 0.0 && sp.dur > 0.0 {
                 self.dur = sp.dur;
@@ -1453,6 +1478,8 @@ impl App {
             duration: sp.dur,
             art: sp.art.clone(),
             source: "spotify".into(),
+            quality: 3,
+            ..Default::default()
         };
         self.track = Some(t.clone());
         self.pos = sp.pos;
@@ -1478,7 +1505,7 @@ impl App {
     }
 
     fn advance(&mut self, auto: bool) {
-        if self.source == Source::Spotify {
+        if self.source == Source::Spotify && !self.spotify_queue {
             self.spotify.send(SpotifyCmd::Next);
             return;
         }
@@ -1520,7 +1547,7 @@ impl App {
             self.seek_to(0.0);
             return;
         }
-        if self.source == Source::Spotify {
+        if self.source == Source::Spotify && !self.spotify_queue {
             self.spotify.send(SpotifyCmd::Prev);
             return;
         }
@@ -1601,7 +1628,7 @@ impl App {
     }
 
     fn request_radio(&mut self, seed: &str) {
-        if seed.is_empty() || self.source != Source::YouTube {
+        if seed.is_empty() {
             return;
         }
         if self.radio_loading && self.radio_seed == seed {
@@ -1611,14 +1638,36 @@ impl App {
         self.radio_loading = true;
         let tx = self.tx.clone();
         let seed = seed.to_string();
+        let spotify_track = self.queue.iter().find(|t| t.id == seed && t.is_spotify()).cloned();
         std::thread::spawn(move || {
-            let tracks = ytm::radio(&seed).unwrap_or_default();
+            // The radio comes from YouTube Music; a Spotify song needs its
+            // YouTube twin as the seed.
+            let yt_seed = match &spotify_track {
+                Some(t) => youtube_twin(t).map(|x| x.id).unwrap_or_default(),
+                None => seed.clone(),
+            };
+            let tracks = if yt_seed.is_empty() { Vec::new() } else { ytm::radio(&yt_seed).unwrap_or_default() };
             let _ = tx.send(Event::RadioDone(seed, tracks));
         });
         self.dirty = true;
     }
 
     fn begin_track(&mut self, t: Track) {
+        if t.is_spotify() {
+            if self.spotify.snapshot().available {
+                self.start_spotify(t);
+                return;
+            }
+            // No Spotify device running: play the same song from YouTube Music.
+            self.set_status("Spotify no está conectado: busco la canción en YouTube Music…");
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let twin = youtube_twin(&t);
+                let _ = tx.send(Event::Substitute(t.id.clone(), twin));
+            });
+            return;
+        }
+        self.spotify_queue = false;
         if self.source == Source::Spotify {
             // Local tracks and YouTube results always play through mpv.
             self.spotify.send(SpotifyCmd::Pause);
@@ -1639,6 +1688,34 @@ impl App {
             self.find_video();
         }
         self.mpv.pause(false);
+        self.db.touch_played(&t);
+        self.current_saved = self.db.is_saved(&t.id);
+        self.start_lyrics(t.clone());
+        self.start_cover(&t);
+        self.dirty = true;
+        self.hiding = false;
+    }
+
+    /// Play a Spotify track on the Connect device (spotifyd) through MPRIS.
+    fn start_spotify(&mut self, t: Track) {
+        if self.video {
+            self.set_video(false);
+        }
+        self.mpv.pause(true);
+        if self.source != Source::Spotify {
+            self.yt_track = None;
+        }
+        self.source = Source::Spotify;
+        self.spotify.send(SpotifyCmd::OpenUri(t.url()));
+        self.spotify_queue = true;
+        self.sp_started = Instant::now();
+        self.sp_was_playing = false;
+        self.spotify_seen = t.id.clone();
+        self.track = Some(t.clone());
+        self.pos = 0.0;
+        self.dur = t.duration;
+        self.playing = true;
+        self.drawn_pos = -1.0;
         self.db.touch_played(&t);
         self.current_saved = self.db.is_saved(&t.id);
         self.start_lyrics(t.clone());
@@ -1833,21 +1910,32 @@ impl App {
         self.searched = q.clone();
         self.searching = true;
         self.dirty = true;
+        self.spotify_search = spotify_api::configured();
         let tx = self.tx.clone();
-        std::thread::spawn(move || match ytm::search(&q) {
-            Ok((tracks, colls)) if !tracks.is_empty() || !colls.is_empty() => {
-                let _ = tx.send(Event::SearchDone(q, tracks, colls));
-            }
-            other => {
-                // Fall back to plain YouTube search if YouTube Music fails.
-                let tracks = yt::search(&q, 20).unwrap_or_default();
-                if tracks.is_empty() {
-                    if let Err(e) = other {
-                        let _ = tx.send(Event::Error(format!("Búsqueda: {e}")));
-                    }
+        std::thread::spawn(move || {
+            let sq = q.clone();
+            let spotify = std::thread::spawn(move || {
+                if spotify_api::configured() {
+                    spotify_api::search(&sq)
+                } else {
+                    Ok(Vec::new())
                 }
-                let _ = tx.send(Event::SearchDone(q, tracks, Vec::new()));
-            }
+            });
+            let (yt_tracks, colls) = match ytm::search(&q) {
+                Ok(r) if !r.0.is_empty() || !r.1.is_empty() => r,
+                // Fall back to plain YouTube search if YouTube Music fails.
+                _ => (yt::search(&q, 20).unwrap_or_default(), Vec::new()),
+            };
+            let sp_tracks = match spotify.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Event::Error(format!("Spotify: {e}")));
+                    Vec::new()
+                }
+                Err(_) => Vec::new(),
+            };
+            let tracks = rank::merge(&q, yt_tracks, sp_tracks);
+            let _ = tx.send(Event::SearchDone(q, tracks, colls));
         });
     }
 
@@ -2144,6 +2232,17 @@ impl App {
                     Err(e) => self.set_status(&format!("No se pudo importar: {e}")),
                 }
             }
+            Event::Substitute(sp_id, twin) => {
+                let current = self.queue.get(self.index).is_some_and(|t| t.id == sp_id);
+                match twin {
+                    Some(yt) if current => {
+                        self.queue[self.index] = yt.clone();
+                        self.begin_track(yt);
+                    }
+                    None if current => self.set_status("No encontré esa canción en YouTube Music"),
+                    _ => {}
+                }
+            }
             Event::VideoFound(id, vid) => {
                 if self.video && self.track.as_ref().is_some_and(|t| t.id == id) {
                     self.video_at = Instant::now();
@@ -2234,6 +2333,7 @@ impl App {
             duration: 0.0,
             art: format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"),
             source: "youtube".into(),
+            ..Default::default()
         });
         self.show();
         self.play_single(track);
@@ -2457,6 +2557,19 @@ impl App {
             if !sp.available {
                 self.switch_source(Source::YouTube);
             } else {
+                // Our queue drives Spotify: when its song finishes, move on.
+                let settled = self.sp_started.elapsed() > Duration::from_secs(5);
+                let near_end = self.dur > 0.0 && self.pos >= self.dur - 3.0;
+                let ended = self.spotify_queue
+                    && settled
+                    && near_end
+                    && ((self.sp_was_playing && !sp.playing)
+                        || spotify_key(&sp.track_id) != self.spotify_seen);
+                self.sp_was_playing = sp.playing;
+                if ended {
+                    self.advance(true);
+                    return;
+                }
                 pos = sp.pos;
                 dur = sp.dur;
                 playing = sp.playing;
@@ -2504,13 +2617,12 @@ impl App {
         }
 
         // Keep something queued after the current song (autoplay).
-        if self.source == Source::YouTube
-            && self.repeat == Repeat::Off
+        if self.repeat == Repeat::Off
             && !self.radio_loading
             && self.index + 1 >= self.queue.len()
         {
             if let Some(id) = self.track.as_ref().map(|t| t.id.clone()) {
-                if self.radio_seed != id && self.track.as_ref().is_some_and(|t| t.source == "youtube") {
+                if self.radio_seed != id {
                     self.request_radio(&id);
                 }
             }
@@ -2673,4 +2785,19 @@ fn spotify_key(track_id: &str) -> String {
     } else {
         format!("sp_{clean}")
     }
+}
+
+/// The same song on YouTube Music (used to play or seed radio for Spotify
+/// results when Spotify itself can't play).
+fn youtube_twin(t: &Track) -> Option<Track> {
+    let title = lyrics::clean_title(&t.title);
+    let q = format!("{title} {}", lyrics::main_artist(&t.artist));
+    let (tracks, _) = ytm::search(&q).ok()?;
+    let mut candidates: Vec<Track> = tracks
+        .into_iter()
+        .filter(|x| lyrics::similar(&lyrics::clean_title(&x.title), &title))
+        .collect();
+    // Prefer the song (static cover, album audio) over a video upload.
+    candidates.sort_by_key(|x| (x.video, x.quality == 1));
+    candidates.into_iter().next()
 }

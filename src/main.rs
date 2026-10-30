@@ -4,7 +4,9 @@ mod lyrics;
 mod model;
 mod mpv;
 mod paths;
+mod rank;
 mod spotify;
+mod spotify_api;
 mod theme;
 mod ui;
 mod yt;
@@ -56,6 +58,9 @@ enum Action {
     /// Look up lyrics for a song and report what was found (diagnostics).
     #[command(hide = true)]
     Lyrics { title: String, artist: String, #[arg(default_value_t = 0.0)] duration: f64 },
+    /// Print ranked search results (diagnostics).
+    #[command(hide = true)]
+    SearchTest { query: String },
     /// Open the search tab, optionally running a query.
     Search { query: Option<String> },
 }
@@ -144,6 +149,13 @@ fn main() {
         Action::Click { x, y } => send(Cmd::Click { x, y }),
         Action::Play { id, title, artist } => send(Cmd::Play { id, title, artist }),
         Action::Search { query } => send(Cmd::Search { query }),
+        Action::SearchTest { query } => {
+            let yt = ytm::search(&query).map(|r| r.0).unwrap_or_default();
+            let sp = spotify_api::search(&query).unwrap_or_default();
+            for t in rank::merge(&query, yt, sp).iter().take(12) {
+                println!("{:?} {:8} vid={} q={} | {} — {}", rank::debug_key(&query, t), t.source, t.video, t.quality, t.title, t.artist);
+            }
+        }
         Action::Lyrics { title, artist, duration } => {
             let t = model::Track { title, artist, duration, ..Default::default() };
             match lyrics::fetch(&t) {

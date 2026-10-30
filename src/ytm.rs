@@ -311,6 +311,15 @@ fn parse_item(kind: &str, r: &Value) -> Option<Item> {
             .unwrap_or_default()
     };
 
+    // ATV = song with a static cover, OMV = official video, UGC = upload.
+    let mvt = find(r, "musicVideoType").and_then(|v| v.as_str()).unwrap_or("");
+    let video = matches!(mvt, "MUSIC_VIDEO_TYPE_OMV" | "MUSIC_VIDEO_TYPE_UGC")
+        || sub_text.starts_with("Video") || sub_text.starts_with("Vídeo");
+    let quality = match mvt {
+        "MUSIC_VIDEO_TYPE_UGC" => 1,
+        _ => 2,
+    };
+
     Some(Item::Song(Track {
         id: video_id.clone(),
         title,
@@ -323,6 +332,8 @@ fn parse_item(kind: &str, r: &Value) -> Option<Item> {
             art
         },
         source: "youtube".into(),
+        video,
+        quality,
     }))
 }
 

@@ -16,12 +16,21 @@ pub struct Track {
     pub duration: f64,
     pub art: String,
     pub source: String,
+    /// The stream itself is a music video (not just a cover).
+    pub video: bool,
+    /// Rough audio quality: 3 Spotify (320 kbps), 2 YouTube Music song or
+    /// official video, 1 user upload.
+    pub quality: u8,
 }
 
 impl Track {
+    pub fn is_spotify(&self) -> bool {
+        self.source == "spotify"
+    }
+
     pub fn url(&self) -> String {
         match self.source.as_str() {
-            "spotify" => format!("https://open.spotify.com/track/{}", self.id),
+            "spotify" => format!("spotify:track:{}", self.id.trim_start_matches("sp_")),
             "local" => self.id.clone(),
             _ => format!("https://music.youtube.com/watch?v={}", self.id),
         }
@@ -143,6 +152,8 @@ pub enum Event {
     ImportDone(Result<usize, String>),
     /// (track id, music video id if one was found)
     VideoFound(String, Option<String>),
+    /// A Spotify song replaced by its YouTube Music twin: (spotify id, twin).
+    Substitute(String, Option<Track>),
     LyricsDone(String, Vec<LyricLine>, bool),
     CoverDone(String, std::path::PathBuf),
     Ended,

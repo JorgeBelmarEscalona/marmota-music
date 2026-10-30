@@ -73,10 +73,33 @@ install -Dm755 target/release/marmota-music ~/.local/bin/marmota-music
 
 Dependencias de sistema: `gtk4`, `gtk4-layer-shell`, `mpv`, `yt-dlp`.
 
+## Spotify
+
+La búsqueda mezcla YouTube Music y Spotify y ordena por: título de la
+canción → artista → si tiene vídeo → calidad de audio. Cada fila muestra el
+ícono de su plataforma a la derecha.
+
+1. **Buscar en Spotify:** crea una app gratuita en
+   <https://developer.spotify.com/dashboard> (cualquier nombre; Redirect URI
+   `http://127.0.0.1:8888/callback`, marca *Web API*). Copia el *Client ID* y el
+   *Client secret* en `~/.config/marmota-music/config.json`
+   (`spotify_client_id`, `spotify_client_secret`).
+2. **Reproducir desde Spotify (Premium):**
+   ```bash
+   sudo pacman -S spotifyd
+   spotifyd authenticate          # abre el enlace, inicia sesión y acepta
+   systemctl --user enable --now spotifyd
+   ```
+   La configuración ya está en `~/.config/spotifyd/spotifyd.conf` (320 kbps,
+   MPRIS en el bus de sesión). El notch reproduce cada canción con
+   `OpenUri` por MPRIS y sigue con su propia cola.
+
+Sin `spotifyd`, una canción de Spotify se reproduce igual: se busca la misma
+canción en YouTube Music.
+
 ## Limitaciones conocidas
 
-- **Spotify**: pendiente (fase 2, vía `librespot` como dispositivo Connect;
-  requiere Premium).
+- **Spotify**: el vídeo y la radio automática vienen de YouTube Music.
 - **Apple Music**: descartado (no hay reproducción viable en Linux).
 - **Blur de fondo**: Hyprland 0.56 no aplica `layer_rule` con `blur` en esta
   instalación (no hay `hyprpm`, así que tampoco HyprGlass). El vidrio se pinta

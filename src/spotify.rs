@@ -29,7 +29,10 @@ pub struct State {
 }
 
 pub enum Cmd {
+    #[allow(dead_code)]
     Play,
+    /// Start a track on the Connect device ("spotify:track:…").
+    OpenUri(String),
     Pause,
     PlayPause,
     Next,
@@ -167,6 +170,7 @@ fn poll(props: &Proxy<'static>, prev: &State) -> Option<State> {
 fn apply(proxy: &Proxy<'static>, cmd: Cmd, state: &State) -> bool {
     match cmd {
         Cmd::Play => proxy.call_method("Play", &()).is_ok(),
+        Cmd::OpenUri(uri) => proxy.call_method("OpenUri", &(uri,)).is_ok(),
         Cmd::Pause => proxy.call_method("Pause", &()).is_ok(),
         Cmd::PlayPause => proxy.call_method("PlayPause", &()).is_ok(),
         Cmd::Next => proxy.call_method("Next", &()).is_ok(),
@@ -213,13 +217,11 @@ fn run(rx: Receiver<Cmd>, st: Arc<Mutex<State>>) {
         let prev = st.lock().map(|s| s.clone()).unwrap_or_default();
         match poll(props, &prev) {
             Some(next) => {
-                eprintln!("[{:?}] spotify poll: {} {} pos={:.1}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0) % 100000, next.playing, next.title, next.pos);
                 if let Ok(mut s) = st.lock() {
                     *s = next;
                 }
             }
             None => {
-                eprintln!("spotify poll failed");
                 if let Ok(mut s) = st.lock() {
                     s.available = false;
                 }

@@ -100,6 +100,8 @@ fn parse_entry(v: &Value) -> Option<Track> {
         duration,
         art,
         source: "youtube".into(),
+        video: true,
+        quality: 1,
     })
 }
 
