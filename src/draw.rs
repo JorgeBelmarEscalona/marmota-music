@@ -1028,6 +1028,20 @@ impl App {
         cr.fill();
         if !self.lyrics_synced && l.screen.w <= 0.0 {
             label(cr, "Letra sin sincronizar", content.x + content.w - 150.0, content.y + content.h - 16.0, 150.0, 9.5, pango::Weight::Normal, theme::DIM, 0.6 * a);
+        } else if self.lyrics_synced {
+            // Timed against a different recording (video intro, live take…)
+            // or already corrected: say how to fix it.
+            let mismatch = self.lyric_dur > 0.0 && self.dur > 0.0 && (self.dur - self.lyric_dur).abs() > 3.0;
+            let hint = if self.lyric_offset.abs() >= 0.05 {
+                Some(format!("Ajuste {:+.1} s · [ ] para corregir", self.lyric_offset).replace('.', ","))
+            } else if mismatch {
+                Some("¿Desfasada? Clic derecho en la línea que suena, o [ ]".to_string())
+            } else {
+                None
+            };
+            if let Some(h) = hint {
+                label_center(cr, &h, content.x, content.y + content.h - 16.0, content.w, 9.5, pango::Weight::Normal, theme::DIM, 0.7 * a);
+            }
         }
     }
 

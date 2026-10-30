@@ -155,7 +155,8 @@ pub enum Event {
     VideoFound(String, Option<String>),
     /// A Spotify song replaced by its YouTube Music twin: (spotify id, twin).
     Substitute(String, Option<Track>),
-    LyricsDone(String, Vec<LyricLine>, bool),
+    /// (track id, lines, synced, length of the lyric's recording)
+    LyricsDone(String, Vec<LyricLine>, bool, f64),
     CoverDone(String, Option<Pixels>),
     Ended,
     Cmd(Cmd),

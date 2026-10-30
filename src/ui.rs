@@ -274,6 +274,10 @@ pub struct App {
     pub lyrics_synced: bool,
     pub lyrics_state: u8, // 0 idle, 1 loading, 2 ready, 3 none
     pub lyric_scroll: f64,
+    /// Seconds the lyrics are shifted (positive = later), saved per song.
+    pub lyric_offset: f64,
+    /// Length of the recording the lyrics were timed against.
+    pub lyric_dur: f64,
     pub lyric_from: f64,
     pub lyric_to: f64,
     pub lyric_t0: Instant,
@@ -532,6 +536,8 @@ fn build(
         lyrics_synced: false,
         lyrics_state: 0,
         lyric_scroll: 0.0,
+        lyric_offset: 0.0,
+        lyric_dur: 0.0,
         lyric_from: 0.0,
         lyric_to: 0.0,
         lyric_t0: Instant::now(),
@@ -611,9 +617,14 @@ fn build(
         let a = app_cell.clone();
         let a2 = app_cell.clone();
         let click = gtk::GestureClick::new();
-        click.connect_pressed(move |_, _n, x, y| {
+        click.set_button(0);
+        click.connect_pressed(move |g, _n, x, y| {
             let mut s = a.borrow_mut();
-            s.on_press(x, y);
+            if g.current_button() == 3 {
+                s.on_secondary(x, y);
+            } else {
+                s.on_press(x, y);
+            }
         });
         click.connect_released(move |_, _n, x, y| {
             let mut s = a2.borrow_mut();
@@ -707,6 +718,14 @@ fn build(
                 }
                 gtk::gdk::Key::slash | gtk::gdk::Key::f => {
                     s.open_search();
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::bracketleft => {
+                    s.shift_lyrics(-0.5);
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::bracketright => {
+                    s.shift_lyrics(0.5);
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::v => {
@@ -1197,6 +1216,53 @@ impl App {
         }
     }
 
+    /// Right click on a lyric line: "this line is being sung now".
+    fn on_secondary(&mut self, x: f64, y: f64) {
+        let k = self.ui_scale.max(0.1);
+        let (ox, oy) = self.origin();
+        let (x, y) = (x / k - ox, y / k - oy);
+        if self.tab != Tab::Lyrics || !self.lyrics_synced {
+            return;
+        }
+        let l = self.layout();
+        for (r, item) in self.rows(l.content) {
+            if let RowItem::Lyric(i) = item {
+                if r.contains(x, y) {
+                    if let Some(line) = self.lyrics.get(i) {
+                        let off = self.pos - line.t;
+                        self.set_lyric_offset(off);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn shift_lyrics(&mut self, delta: f64) {
+        if !self.lyrics_synced {
+            return;
+        }
+        self.set_lyric_offset(self.lyric_offset + delta);
+    }
+
+    fn set_lyric_offset(&mut self, off: f64) {
+        let off = (off * 10.0).round() / 10.0;
+        self.lyric_offset = off;
+        self.lyric_to = f64::MIN;
+        self.lyric_manual = Instant::now() - Duration::from_secs(30);
+        if let Some(id) = self.track.as_ref().map(|t| t.id.clone()) {
+            self.db.set_lyric_offset(&id, off);
+        }
+        let msg = if off.abs() < 0.05 {
+            "Letra con su sincronización original".to_string()
+        } else if off > 0.0 {
+            format!("Letra retrasada {:.1} s", off).replace('.', ",")
+        } else {
+            format!("Letra adelantada {:.1} s", -off).replace('.', ",")
+        };
+        self.set_status(&msg);
+    }
+
     fn act(&mut self, hit: Hit, x: f64, _y: f64) {
         match hit {
             Hit::Prev => self.prev(),
@@ -1408,7 +1474,7 @@ impl App {
             RowItem::Lyric(i) => {
                 if self.lyrics_synced {
                     if let Some(line) = self.lyrics.get(i) {
-                        let t = line.t;
+                        let t = line.t + self.lyric_offset;
                         self.seek_to(t);
                         self.lyric_manual = Instant::now() - Duration::from_secs(30);
                     }
@@ -1836,8 +1902,12 @@ impl App {
         self.lyrics_state = 1;
         self.lyric_idx = 0;
         self.lyric_scroll = 0.0;
-        if let Some((synced, plain)) = self.db.lyrics(&t.id) {
+        self.lyric_offset = 0.0;
+        self.lyric_dur = 0.0;
+        if let Some((synced, plain, dur, offset)) = self.db.lyrics(&t.id) {
             if !synced.is_empty() {
+                self.lyric_dur = dur;
+                self.lyric_offset = offset;
                 self.lyrics = lyrics::parse_lrc(&synced);
                 self.lyrics_synced = true;
                 self.lyrics_state = 2;
@@ -1858,13 +1928,13 @@ impl App {
                     // time in case a synced version shows up (or LRCLIB was down).
                     if l.synced {
                         if let Ok(db) = Db::open() {
-                            let _ = db.save_lyrics(&id, l.synced_text.as_deref(), &l.plain_text);
+                            let _ = db.save_lyrics(&id, l.synced_text.as_deref(), &l.plain_text, l.dur);
                         }
                     }
-                    let _ = tx.send(Event::LyricsDone(id, l.lines, l.synced));
+                    let _ = tx.send(Event::LyricsDone(id, l.lines, l.synced, l.dur));
                 }
                 Err(_) => {
-                    let _ = tx.send(Event::LyricsDone(id, Vec::new(), false));
+                    let _ = tx.send(Event::LyricsDone(id, Vec::new(), false, 0.0));
                 }
             }
         });
@@ -2393,10 +2463,11 @@ impl App {
                     self.set_status("Cargando vídeo…");
                 }
             }
-            Event::LyricsDone(id, lines, synced) => {
+            Event::LyricsDone(id, lines, synced, dur) => {
                 if self.track.as_ref().map(|t| t.id.as_str()) == Some(id.as_str()) {
                     self.lyrics = lines;
                     self.lyrics_synced = synced;
+                    self.lyric_dur = dur;
                     self.lyrics_state = if self.lyrics.is_empty() { 3 } else { 2 };
                     self.lyric_idx = 0;
                     self.lyric_scroll = 0.0;
@@ -2858,7 +2929,7 @@ impl App {
             let idx = self
                 .lyrics
                 .iter()
-                .rposition(|l| l.t <= self.pos + 0.12)
+                .rposition(|l| l.t + self.lyric_offset <= self.pos + 0.12)
                 .unwrap_or(0);
             if idx != self.lyric_idx {
                 self.lyric_idx = idx;

@@ -58,6 +58,17 @@ impl Db {
                  PRAGMA user_version = 1;",
             )?;
         }
+        if version < 2 {
+            // v2: remember how long the lyric's recording is and the user's
+            // per-song timing correction.
+            for sql in [
+                "ALTER TABLE lyrics ADD COLUMN dur REAL DEFAULT 0",
+                "ALTER TABLE lyrics ADD COLUMN offset REAL DEFAULT 0",
+            ] {
+                let _ = conn.execute(sql, []);
+            }
+            conn.execute_batch("PRAGMA user_version = 2;")?;
+        }
         Ok(Self { conn })
     }
 
@@ -259,24 +270,33 @@ impl Db {
         out
     }
 
-    pub fn lyrics(&self, id: &str) -> Option<(String, String)> {
+    /// (synced, plain, recording length, timing offset)
+    pub fn lyrics(&self, id: &str) -> Option<(String, String, f64, f64)> {
         self.conn
             .query_row(
-                "SELECT COALESCE(synced,''), COALESCE(plain,'') FROM lyrics WHERE track_id=?1",
+                "SELECT COALESCE(synced,''), COALESCE(plain,''), COALESCE(dur,0), COALESCE(offset,0)
+                 FROM lyrics WHERE track_id=?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .ok()
             .flatten()
     }
 
-    pub fn save_lyrics(&self, id: &str, synced: Option<&str>, plain: &str) -> Result<()> {
+    pub fn save_lyrics(&self, id: &str, synced: Option<&str>, plain: &str, dur: f64) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO lyrics(track_id,synced,plain) VALUES(?1,?2,?3)
-             ON CONFLICT(track_id) DO UPDATE SET synced=?2, plain=?3",
-            params![id, synced, plain],
+            "INSERT INTO lyrics(track_id,synced,plain,dur) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(track_id) DO UPDATE SET synced=?2, plain=?3, dur=?4",
+            params![id, synced, plain, dur],
         )?;
         Ok(())
+    }
+
+    pub fn set_lyric_offset(&self, id: &str, offset: f64) {
+        let _ = self.conn.execute(
+            "UPDATE lyrics SET offset=?2 WHERE track_id=?1",
+            params![id, offset],
+        );
     }
 }

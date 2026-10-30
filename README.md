@@ -22,6 +22,7 @@ Busca y reproduce desde **YouTube Music** y **Spotify**.
 | Volumen | arrastrar la barra, rueda del ratón, o `↑` / `↓` |
 | Encoger a la píldora mini | clic en el chevron, `Esc` |
 | Letras / biblioteca / buscar / cola | pestañas de la derecha |
+| Corregir una letra desfasada | clic derecho en la línea que está sonando, o `[` / `]` (±0,5 s); se recuerda por canción |
 | Ver el videoclip dentro del notch | botón ▶▭ junto a *Guardar*, o `v` |
 | Guardar en la biblioteca | botón *Guardar* |
 | Crear lista | Biblioteca → *Nueva lista* |

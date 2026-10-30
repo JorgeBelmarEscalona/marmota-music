@@ -6,6 +6,8 @@ use serde::Deserialize;
 use crate::model::{LyricLine, Track};
 
 pub struct Lyrics {
+    /// Length of the recording the timestamps belong to (0 = unknown).
+    pub dur: f64,
     pub lines: Vec<LyricLine>,
     pub synced: bool,
     pub synced_text: Option<String>,
@@ -14,6 +16,8 @@ pub struct Lyrics {
 
 #[derive(Deserialize)]
 struct LrcReply {
+    #[serde(default)]
+    duration: Option<f64>,
     #[serde(rename = "syncedLyrics")]
     synced: Option<String>,
     #[serde(rename = "plainLyrics")]
@@ -69,6 +73,7 @@ pub fn parse_plain(text: &str) -> Vec<LyricLine> {
 fn build(synced: Option<String>, plain: Option<String>) -> Result<Lyrics> {
     if let Some(s) = synced.as_deref().filter(|s| !s.trim().is_empty()) {
         return Ok(Lyrics {
+            dur: 0.0,
             lines: parse_lrc(s),
             synced: true,
             synced_text: Some(s.to_string()),
@@ -77,6 +82,7 @@ fn build(synced: Option<String>, plain: Option<String>) -> Result<Lyrics> {
     }
     if let Some(p) = plain.as_deref().filter(|s| !s.trim().is_empty()) {
         return Ok(Lyrics {
+            dur: 0.0,
             lines: parse_plain(p),
             synced: false,
             synced_text: None,
@@ -189,6 +195,7 @@ struct LrcItem {
 }
 
 struct Found {
+    dur: f64,
     synced: Option<String>,
     plain: Option<String>,
 }
@@ -205,7 +212,7 @@ fn lrclib(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) ->
             Ok(r) if r.status().is_success() => {
                 if let Ok(item) = r.json::<LrcReply>() {
                     if item.synced.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-                        return Found { synced: item.synced, plain: item.plain };
+                        return Found { dur: item.duration.unwrap_or(0.0), synced: item.synced, plain: item.plain };
                     }
                     plain = item.plain;
                 }
@@ -232,7 +239,7 @@ fn lrclib(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) ->
                 })
             });
             if let Some(x) = synced {
-                return Found { synced: x.synced.clone(), plain: x.plain.clone() };
+                return Found { dur: x.duration.unwrap_or(0.0), synced: x.synced.clone(), plain: x.plain.clone() };
             }
             if plain.is_none() {
                 plain = list
@@ -242,12 +249,12 @@ fn lrclib(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) ->
             }
         }
     }
-    Found { synced: None, plain }
+    Found { dur: 0.0, synced: None, plain }
 }
 
 /// NetEase Cloud Music has timed lyrics for a lot of what LRCLIB misses,
 /// including most Latin and Asian catalogues.
-fn netease(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) -> Option<String> {
+fn netease(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) -> Option<(String, f64)> {
     let query = format!("{title} {artist}");
     let v: serde_json::Value = c
         .get("https://music.163.com/api/search/get")
@@ -275,6 +282,7 @@ fn netease(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) -
         .find(|s| matches(s, 6.0))
         .or_else(|| songs.iter().find(|s| matches(s, 30.0)))?;
     let id = pick.get("id")?.as_i64()?;
+    let found_dur = pick.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) / 1000.0;
     let l: serde_json::Value = c
         .get("https://music.163.com/api/song/lyric")
         .query(&[("id", id.to_string().as_str()), ("lv", "1")])
@@ -297,7 +305,12 @@ fn netease(c: &reqwest::blocking::Client, title: &str, artist: &str, dur: f64) -
     if lines.len() < 4 || lines.iter().all(|l| l.t == 0.0) {
         return None;
     }
-    Some(cleaned.join("\n"))
+    Some((cleaned.join("\n"), found_dur))
+}
+
+fn with_dur(mut l: Lyrics, dur: f64) -> Lyrics {
+    l.dur = dur;
+    l
 }
 
 pub fn fetch(track: &Track) -> Result<Lyrics> {
@@ -318,16 +331,16 @@ pub fn fetch(track: &Track) -> Result<Lyrics> {
 
     let first = lrclib(&c, &title, &artist, dur);
     if first.synced.is_some() {
-        return build(first.synced, first.plain);
+        return build(first.synced, first.plain).map(|l| with_dur(l, first.dur));
     }
-    if let Some(s) = netease(&c, &title, &artist, dur) {
-        return build(Some(s), first.plain);
+    if let Some((s, d)) = netease(&c, &title, &artist, dur) {
+        return build(Some(s), first.plain).map(|l| with_dur(l, d));
     }
     // Uploads titled "Artist - Song" without a proper artist field.
     if let Some((a, t)) = track.title.split_once(" - ") {
         let alt = lrclib(&c, &clean_title(t), &main_artist(a), dur);
         if alt.synced.is_some() || (first.plain.is_none() && alt.plain.is_some()) {
-            return build(alt.synced, alt.plain);
+            return build(alt.synced, alt.plain).map(|l| with_dur(l, alt.dur));
         }
     }
     build(None, first.plain).map_err(|_| anyhow!("no se encontró la letra"))
