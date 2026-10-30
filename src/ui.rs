@@ -241,6 +241,7 @@ pub struct App {
     pub spotify_queue: bool,
     pub sp_started: Instant,
     pub sp_was_playing: bool,
+    pub sp_confirmed: bool,
     pub spotify_search: bool,
     pub accounts_ok: bool,
 
@@ -506,6 +507,7 @@ fn build(
         spotify_queue: false,
         sp_started: Instant::now(),
         sp_was_playing: false,
+        sp_confirmed: false,
         spotify_search: spotify_api::configured(),
         accounts_ok: crate::setup::accounts_configured(),
         playing: false,
@@ -1557,7 +1559,7 @@ impl App {
             return;
         }
         let key = spotify_key(&sp.track_id);
-        if self.spotify_queue && key != self.spotify_seen && self.sp_started.elapsed() < Duration::from_secs(5) {
+        if self.spotify_queue && key != self.spotify_seen && !self.sp_confirmed {
             // Still showing the previous song while ours loads.
             return;
         }
@@ -1756,7 +1758,8 @@ impl App {
 
     fn begin_track(&mut self, t: Track) {
         if t.is_spotify() {
-            if self.spotify.snapshot().available {
+            let sp = self.spotify.snapshot();
+            if sp.available || sp.standby {
                 self.start_spotify(t);
                 return;
             }
@@ -1812,6 +1815,7 @@ impl App {
         self.spotify_queue = true;
         self.sp_started = Instant::now();
         self.sp_was_playing = false;
+        self.sp_confirmed = false;
         self.spotify_seen = t.id.clone();
         self.track = Some(t.clone());
         self.pos = 0.0;
@@ -2705,9 +2709,33 @@ impl App {
         };
         if self.source == Source::Spotify {
             let sp = self.spotify.snapshot();
-            if !sp.available {
+            let waking = sp.standby && self.sp_started.elapsed() < Duration::from_secs(10);
+            if !sp.available && !waking {
                 self.switch_source(Source::YouTube);
             } else {
+                // Spotify accepted the request but never played our song
+                // (e.g. it refuses this account's audio keys): fall back to
+                // the same song on YouTube Music instead of staying silent.
+                if self.spotify_queue
+                    && !self.sp_confirmed
+                    && self.sp_started.elapsed() > Duration::from_secs(9)
+                {
+                    let ours = spotify_key(&sp.track_id) == self.spotify_seen;
+                    if ours && sp.playing && sp.pos > 0.5 {
+                        self.sp_confirmed = true;
+                    } else if let Some(t) = self.track.clone() {
+                        self.spotify.send(SpotifyCmd::Pause);
+                        self.spotify_queue = false;
+                        self.source = Source::YouTube;
+                        self.set_status("Spotify no pudo reproducirla; suena desde YouTube Music");
+                        let tx = self.tx.clone();
+                        std::thread::spawn(move || {
+                            let twin = youtube_twin(&t);
+                            let _ = tx.send(Event::Substitute(t.id.clone(), twin));
+                        });
+                        return;
+                    }
+                }
                 // Our queue drives Spotify: when its song finishes, move on.
                 let settled = self.sp_started.elapsed() > Duration::from_secs(5);
                 let near_end = self.dur > 0.0 && self.pos >= self.dur - 3.0;

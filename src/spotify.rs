@@ -17,6 +17,9 @@ use zbus::zvariant::{ObjectPath, OwnedValue};
 #[derive(Clone, Default)]
 pub struct State {
     pub available: bool,
+    /// spotifyd is running but idle: it publishes MPRIS only once it is the
+    /// active Connect device, which `TransferPlayback` takes care of.
+    pub standby: bool,
     pub playing: bool,
     pub title: String,
     pub artist: String,
@@ -65,6 +68,29 @@ impl Spotify {
 }
 
 type Client = (Connection, Proxy<'static>, Proxy<'static>);
+
+/// Bus name of spotifyd's own control interface, present even while idle.
+fn spotifyd_controls() -> Option<(Connection, String)> {
+    let conn = Connection::session().ok()?;
+    let dbus = Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").ok()?;
+    let names: Vec<String> = dbus.call("ListNames", &()).ok()?;
+    let name = names.into_iter().find(|n| n.starts_with("rs.spotifyd.instance"))?;
+    Some((conn, name))
+}
+
+/// Make the idle spotifyd the active device so it exposes MPRIS.
+fn activate() -> Option<Client> {
+    let (conn, name) = spotifyd_controls()?;
+    let ctl = Proxy::new(&conn, name, "/rs/spotifyd/Controls", "rs.spotifyd.Controls").ok()?;
+    ctl.call_method("TransferPlayback", &()).ok()?;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(200));
+        if let Some(c) = connect() {
+            return Some(c);
+        }
+    }
+    None
+}
 
 fn connect() -> Option<Client> {
     let conn = Connection::session().ok()?;
@@ -151,6 +177,7 @@ fn poll(props: &Proxy<'static>, prev: &State) -> Option<State> {
     let dur = number(meta.get("mpris:length")) / 1_000_000.0;
     Some(State {
         available: true,
+        standby: false,
         playing: status == "Playing",
         title: text(meta.get("xesam:title")),
         artist: meta
@@ -205,8 +232,26 @@ fn run(rx: Receiver<Cmd>, st: Arc<Mutex<State>>) {
                 }
             }
             if !available {
-                // spotifyd may start later; retry quietly.
-                thread::sleep(Duration::from_secs(3));
+                let standby = spotifyd_controls().is_some();
+                if let Ok(mut s) = st.lock() {
+                    s.standby = standby;
+                }
+                // spotifyd may start later; wait for commands meanwhile. A
+                // track request wakes an idle spotifyd up.
+                match rx.recv_timeout(Duration::from_secs(3)) {
+                    Ok(Cmd::OpenUri(uri)) if standby => {
+                        if let Some(c) = activate() {
+                            let _ = c.1.call_method("OpenUri", &(uri,));
+                            client = Some(c);
+                            if let Ok(mut s) = st.lock() {
+                                s.available = true;
+                                s.standby = false;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    _ => {}
+                }
                 continue;
             }
         }
