@@ -1,0 +1,30 @@
+[package]
+name = "marmota-music"
+version = "0.1.0"
+edition = "2021"
+description = "Liquid-glass music notch for Omarchy"
+license = "MIT"
+
+[dependencies]
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+cairo-rs = "0.22"
+pangocairo = "0.22"
+glib = "0.22"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "webpki-roots", "charset", "query"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+anyhow = "1"
+dirs = "7"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+zbus = { version = "5", features = ["blocking-api"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
