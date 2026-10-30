@@ -18,7 +18,8 @@ echo "${A}${B}♪ Marmota Music${X} — instalación"
 
 step "1 · Dependencias"
 missing=()
-for p in gtk4 gtk4-layer-shell mpv yt-dlp; do
+# spotifyd is small and only runs once the user signs in to Spotify.
+for p in gtk4 gtk4-layer-shell mpv yt-dlp spotifyd; do
   pacman -Q "$p" &>/dev/null || missing+=("$p")
 done
 command -v cargo &>/dev/null || missing+=(rust)
@@ -26,7 +27,7 @@ if ((${#missing[@]})); then
   echo "  Faltan: ${B}${missing[*]}${X} (se instalarán con sudo)"
   sudo pacman -S --needed "${missing[@]}"
 fi
-ok "gtk4, gtk4-layer-shell, mpv, yt-dlp y rust listos"
+ok "gtk4, gtk4-layer-shell, mpv, yt-dlp, spotifyd y rust listos"
 
 step "2 · Compilar"
 cargo build --release --quiet
@@ -73,6 +74,12 @@ ok "Notch en marcha"
 step "5 · Cuentas"
 if [[ "${1:-}" != "--setup" ]] && [[ -f "$CONFIG" ]] && grep -qE '"(setup_done|cookies_browser)"' "$CONFIG"; then
   ok "Tus cuentas ya están configuradas"
+  # Spotify was set up for search but never signed in on this machine
+  # (e.g. spotifyd was just installed): offer only that step.
+  creds="${XDG_CACHE_HOME:-$HOME/.cache}/spotifyd/oauth/credentials.json"
+  if grep -qE '"spotify_client_id": *"[^"]+"' "$CONFIG" && [[ ! -f "$creds" ]]; then
+    "$BIN" setup spotify
+  fi
   info "Para cambiarlas: marmota-music setup"
 else
   "$BIN" setup

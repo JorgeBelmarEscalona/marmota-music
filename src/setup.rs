@@ -151,6 +151,12 @@ fn spotifyd_conf() {
 
 fn spotify_playback() {
     println!("\n  {B}Reproducir desde Spotify{X} {D}(requiere Premium){X}");
+    let creds = dirs::cache_dir().unwrap_or_default().join("spotifyd/oauth/credentials.json");
+    if creds.exists() && has("spotifyd") {
+        ok("Sesión de Spotify ya guardada en este equipo");
+        let _ = Command::new("systemctl").args(["--user", "enable", "--now", "spotifyd"]).status();
+        return;
+    }
     if !yes("  ¿Tu cuenta de Spotify es Premium?", true) {
         println!("  {D}Las canciones de Spotify sonarán desde YouTube Music.{X}");
         return;
@@ -226,7 +232,12 @@ fn spotify_search() {
 
 fn spotify() {
     step(2, "Spotify");
-    if !yes("  ¿Tienes cuenta de Spotify?", false) {
+    let creds = dirs::cache_dir().unwrap_or_default().join("spotifyd/oauth/credentials.json");
+    if crate::spotify_api::configured() && creds.exists() {
+        ok("Spotify ya está conectado (búsqueda y reproducción)");
+        return;
+    }
+    if !crate::spotify_api::configured() && !yes("  ¿Tienes cuenta de Spotify?", false) {
         println!("  {D}Sin problema: todo funciona con YouTube Music.{X}");
         return;
     }
@@ -234,7 +245,18 @@ fn spotify() {
     spotify_playback();
 }
 
-pub fn run() {
+pub fn run(only: Option<&str>) {
+    match only {
+        Some("spotify") => {
+            spotify_playback();
+            return;
+        }
+        Some("youtube") => {
+            youtube();
+            return;
+        }
+        _ => {}
+    }
     println!("\n{A}{B}♪ Marmota Music{X} — conectemos tus cuentas");
     println!("{D}  Responde s/n (Enter elige la opción en mayúscula). Repítelo cuando quieras con «marmota-music setup».{X}");
     youtube();

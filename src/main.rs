@@ -56,8 +56,9 @@ enum Action {
         #[arg(long)]
         artist: Option<String>,
     },
-    /// Connect YouTube Music and Spotify step by step.
-    Setup,
+    /// Connect YouTube Music and Spotify step by step (`setup spotify` or
+    /// `setup youtube` for just one).
+    Setup { only: Option<String> },
     /// Reload the library (after importing playlists from outside).
     #[command(hide = true)]
     Refresh,
@@ -162,7 +163,7 @@ fn main() {
         Action::Click { x, y } => send(Cmd::Click { x, y }),
         Action::Play { id, title, artist } => send(Cmd::Play { id, title, artist }),
         Action::Search { query } => send(Cmd::Search { query }),
-        Action::Setup => setup::run(),
+        Action::Setup { only } => setup::run(only.as_deref()),
         // Only nudge a running notch; never start one just for this.
         Action::Refresh => {
             let _ = request(&Cmd::Refresh);

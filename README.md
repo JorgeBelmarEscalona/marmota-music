@@ -77,7 +77,8 @@ cd marmota-music
 
 El instalador:
 
-1. instala lo que falte (`gtk4`, `gtk4-layer-shell`, `mpv`, `yt-dlp`, `rust`);
+1. instala lo que falte (`gtk4`, `gtk4-layer-shell`, `mpv`, `yt-dlp`,
+   `spotifyd`, `rust`) con una sola contraseña de sudo;
 2. compila e instala `~/.local/bin/marmota-music`;
 3. agrega a Hyprland el atajo `Super + Shift + M`, el arranque automático y
    la regla de vidrio (si ya existen, no toca nada);
@@ -110,14 +111,10 @@ canción → artista → si tiene vídeo → calidad de audio. Cada fila muestra
    `http://127.0.0.1:8888/callback`, marca *Web API*). Copia el *Client ID* y el
    *Client secret* en `~/.config/marmota-music/config.json`
    (`spotify_client_id`, `spotify_client_secret`).
-2. **Reproducir desde Spotify (Premium):**
-   ```bash
-   sudo pacman -S spotifyd
-   spotifyd authenticate          # abre el enlace, inicia sesión y acepta
-   systemctl --user enable --now spotifyd
-   ```
-   La configuración ya está en `~/.config/spotifyd/spotifyd.conf` (320 kbps,
-   MPRIS en el bus de sesión). El notch reproduce cada canción con
+2. **Reproducir desde Spotify (Premium):** `install.sh` ya instala
+   `spotifyd`; el asistente (`marmota-music setup spotify`) abre el inicio de
+   sesión **una sola vez por equipo** y lo deja arrancando solo. Crea
+   `~/.config/spotifyd/spotifyd.conf` (320 kbps, MPRIS en el bus de sesión). El notch reproduce cada canción con
    `OpenUri` por MPRIS y sigue con su propia cola.
 
 Sin `spotifyd`, una canción de Spotify se reproduce igual: se busca la misma
