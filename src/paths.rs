@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 pub fn data_dir() -> PathBuf {
     dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join("marmota-music")
 }
 
 pub fn cache_dir() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join("marmota-music")
 }
 
@@ -17,15 +17,26 @@ pub fn art_path(id: &str) -> PathBuf {
 }
 
 pub fn runtime_dir() -> PathBuf {
-    dirs::runtime_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+    dirs::runtime_dir().unwrap_or_else(std::env::temp_dir)
 }
 
+/// Control socket of the daemon. Windows has no Unix sockets in std, so there
+/// the daemon listens on a loopback TCP port and this file holds the port.
 pub fn socket() -> PathBuf {
-    runtime_dir().join("marmota-music.sock")
+    if cfg!(windows) {
+        runtime_dir().join("marmota-music.port")
+    } else {
+        runtime_dir().join("marmota-music.sock")
+    }
 }
 
+/// mpv's JSON IPC endpoint: a Unix socket, or a named pipe on Windows.
 pub fn mpv_socket() -> PathBuf {
-    runtime_dir().join("marmota-music-mpv.sock")
+    if cfg!(windows) {
+        PathBuf::from(r"\\.\pipe\marmota-music-mpv")
+    } else {
+        runtime_dir().join("marmota-music-mpv.sock")
+    }
 }
 
 pub fn ensure_dirs() {
@@ -43,7 +54,7 @@ pub fn thumb_path(url: &str) -> PathBuf {
 
 pub fn config_file() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
         .join("marmota-music")
         .join("config.json")
 }
@@ -52,7 +63,8 @@ pub fn config_file() -> PathBuf {
 pub fn config() -> serde_json::Value {
     std::fs::read_to_string(config_file())
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+        // Windows editors may save it with a byte-order mark.
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
@@ -67,6 +79,21 @@ pub fn set_config(key: &str, value: serde_json::Value) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+}
+
+/// cookies.txt saved by "Iniciar sesión con Google", if there is one.
+pub fn cookies_file() -> Option<PathBuf> {
+    let path = config().get("cookies_file")?.as_str().filter(|s| !s.is_empty())?.to_string();
+    Some(PathBuf::from(path)).filter(|p| p.is_file())
+}
+
+/// How yt-dlp gets the user's YouTube session: the signed-in cookies.txt,
+/// or else the browser's own cookie store.
+pub fn cookie_args() -> [String; 2] {
+    match cookies_file() {
+        Some(file) => ["--cookies".into(), file.display().to_string()],
+        None => ["--cookies-from-browser".into(), cookies_browser()],
+    }
 }
 
 /// Browser whose YouTube session yt-dlp borrows to import the user's

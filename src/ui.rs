@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
+#[cfg(unix)]
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::db::Db;
@@ -66,8 +67,23 @@ pub enum RowItem {
     DeletePlaylist(i64),
     NewPlaylist,
     Import,
-    /// Open the account assistant.
+    /// Open the accounts view.
     Connect,
+    // Accounts view (Library → Cuentas).
+    AccountsBack,
+    AccountInfo(Account),
+    /// Use the YouTube session of the browser at this index.
+    Browser(usize),
+    /// Open a browser window to sign in to Google.
+    GoogleLogin,
+    YouTubeLogin,
+    YouTubeDisconnect,
+    SpotifyApp,
+    SpotifyKeys,
+    SpotifyForget,
+    /// spotifyd needs sudo and its own sign-in: the terminal assistant.
+    #[cfg_attr(windows, allow(dead_code))]
+    SpotifyPlayback,
     Back,
     DetailPlay,
     DetailShuffle,
@@ -176,10 +192,25 @@ impl RowItem {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Account {
+    YouTube,
+    Spotify,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EntryMode {
     Hidden,
     Search,
     NewPlaylist,
+    SpotifyId,
+    SpotifySecret,
+}
+
+impl EntryMode {
+    /// Entries of the Library tab, dropped when the user clicks elsewhere.
+    fn transient(self) -> bool {
+        matches!(self, EntryMode::NewPlaylist | EntryMode::SpotifyId | EntryMode::SpotifySecret)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -244,6 +275,8 @@ pub struct App {
     pub sp_confirmed: bool,
     pub spotify_search: bool,
     pub accounts_ok: bool,
+    /// Browser whose YouTube session is in use, when detected.
+    pub yt_browser: Option<&'static str>,
 
     pub playing: bool,
     pub pos: f64,
@@ -290,6 +323,25 @@ pub struct App {
     pub mixes: Vec<Collection>,
     pub detail: Option<Detail>,
     pub importing: bool,
+    /// The Library tab shows the accounts view instead of the lists.
+    pub accounts: bool,
+    /// Browsers with a profile here, as (name, yt-dlp cookies spec).
+    pub browsers: Vec<(&'static str, String)>,
+    /// Browser the "Iniciar sesión con Google" window opens in.
+    pub login_browser: Option<&'static str>,
+    /// Waiting for the user to sign in in that window.
+    pub logging_in: bool,
+    /// Signed in with Google from the notch (cookies.txt in use).
+    pub yt_google: bool,
+    /// Signed-in account: (name, @handle, photo URL); empty when unknown.
+    pub yt_account: (String, String, String),
+    /// Import under way: (lists done, total, list being read).
+    pub import_progress: Option<(usize, usize, String)>,
+    /// Why the last sign-in or import failed; shown until the next try.
+    pub account_error: Option<String>,
+    /// Client ID typed while the entry asks for the secret.
+    pub spotify_id: String,
+    pub checking_spotify: bool,
     pub confirm_delete: Option<(i64, Instant)>,
 
     pub search_query: String,
@@ -351,6 +403,58 @@ pub fn run(
 
     app.run_with_args::<&str>(&[]);
     Ok(())
+}
+
+/// Songs of a playlist saved from YouTube Music ("VL…" id). Public lists come
+/// straight from YouTube Music; private ones (and "Liked music") need the
+/// user's session via yt-dlp.
+fn remote_tracks(remote: &str) -> Result<Vec<Track>, String> {
+    let list_id = remote.strip_prefix("VL").unwrap_or(remote);
+    let mut tracks = Vec::new();
+    if list_id != "LM" {
+        tracks = ytm::collection(remote).map(|r| r.1).unwrap_or_default();
+    }
+    if tracks.is_empty() && remote.starts_with("VL") {
+        let url = format!("https://music.youtube.com/playlist?list={list_id}");
+        tracks = yt::playlist(&url).map_err(|e| e.to_string())?;
+    }
+    Ok(tracks)
+}
+
+/// Import the user's YouTube Music lists with their songs, reporting
+/// progress list by list: (lists imported, lists that could not be read).
+fn import(tx: &Sender<Event>) -> Result<(usize, usize), String> {
+    let progress = |done, total, label: &str| {
+        let _ = tx.send(Event::ImportProgress(done, total, label.to_string()));
+    };
+    // With the notch's own sign-in, first check whose session it is.
+    if let Some(file) = paths::cookies_file() {
+        let (name, handle, photo) = ytm::account(&file).map_err(|e| e.to_string())?;
+        paths::set_config("youtube_name", name.into());
+        paths::set_config("youtube_handle", handle.into());
+        paths::set_config("youtube_photo", photo.into());
+    }
+    progress(0, 0, "Buscando tus listas…");
+    let lists = yt::account_playlists().map_err(|e| e.to_string())?;
+    let mut db = Db::open().map_err(|e| e.to_string())?;
+    // The session works: the account counts as connected.
+    paths::set_config("youtube_account", true.into());
+    paths::set_config("setup_done", true.into());
+    let mut failed = 0;
+    for (i, (id, title)) in lists.iter().enumerate() {
+        progress(i, lists.len(), title);
+        let remote = format!("VL{id}");
+        let Ok(pid) = db.upsert_remote_playlist(title, &remote, "") else { continue };
+        match remote_tracks(&remote) {
+            Ok(tracks) if !tracks.is_empty() => {
+                let _ = db.set_playlist_tracks(pid, &tracks);
+                let _ = db.upsert_remote_playlist(title, &remote, &ytm::big_art(&tracks[0].art));
+            }
+            Ok(_) => {}
+            Err(_) => failed += 1,
+        }
+    }
+    Ok((lists.len(), failed))
 }
 
 /// A few threads that fetch list thumbnails into the cache.
@@ -447,13 +551,18 @@ fn build(
     window.add_css_class("mm-window");
     window.set_default_size(COLLAPSED_W as i32, COLLAPSED_H as i32);
 
-    window.init_layer_shell();
-    window.set_namespace(Some("marmota-music"));
-    window.set_layer(Layer::Top);
-    window.set_anchor(Edge::Bottom, true);
-    window.set_margin(Edge::Bottom, 14);
-    window.set_exclusive_zone(0);
-    window.set_keyboard_mode(KeyboardMode::OnDemand);
+    // On Windows the notch is a plain undecorated window that win::place
+    // pins above the taskbar.
+    #[cfg(unix)]
+    {
+        window.init_layer_shell();
+        window.set_namespace(Some("marmota-music"));
+        window.set_layer(Layer::Top);
+        window.set_anchor(Edge::Bottom, true);
+        window.set_margin(Edge::Bottom, 14);
+        window.set_exclusive_zone(0);
+        window.set_keyboard_mode(KeyboardMode::OnDemand);
+    }
     window.set_visible(false);
 
     let area = gtk::DrawingArea::new();
@@ -514,6 +623,7 @@ fn build(
         sp_confirmed: false,
         spotify_search: spotify_api::configured(),
         accounts_ok: crate::setup::accounts_configured(),
+        yt_browser: crate::setup::connected_browser(),
         playing: false,
         pos: 0.0,
         dur: 0.0,
@@ -549,6 +659,16 @@ fn build(
         mixes: Vec::new(),
         detail: None,
         importing: false,
+        accounts: false,
+        browsers: Vec::new(),
+        login_browser: None,
+        logging_in: false,
+        yt_google: crate::paths::cookies_file().is_some(),
+        yt_account: Default::default(),
+        import_progress: None,
+        account_error: None,
+        spotify_id: String::new(),
+        checking_spotify: false,
         confirm_delete: None,
         search_query: String::new(),
         searched: String::new(),
@@ -668,7 +788,9 @@ fn build(
             let Ok(mut s) = a.try_borrow_mut() else {
                 return glib::Propagation::Proceed;
             };
-            if s.entry.has_focus() {
+            // The entry hands focus to its inner text widget, so ask whether
+            // focus is anywhere inside it.
+            if s.entry.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN) {
                 if key == gtk::gdk::Key::Escape {
                     if s.entry_mode == EntryMode::Search && !s.search_query.is_empty() {
                         s.search_query.clear();
@@ -767,6 +889,7 @@ fn build(
                         s.run_search();
                     }
                     EntryMode::NewPlaylist => s.create_playlist_from_entry(),
+                    EntryMode::SpotifyId | EntryMode::SpotifySecret => s.spotify_key_entered(),
                     EntryMode::Hidden => {}
                 }
             }
@@ -871,6 +994,8 @@ impl App {
                 rect.0, rect.1, rect.2, rect.3,
             ));
             surface.set_input_region(Some(&region));
+            #[cfg(windows)]
+            crate::win::set_region(&self.window, rect);
             self.input_rect = rect;
         }
     }
@@ -1009,11 +1134,76 @@ impl App {
 
         match self.tab {
             Tab::Lyrics => {}
+            Tab::Library if self.accounts => {
+                let half = (w - 8.0) / 2.0;
+                let button = |out: &mut Vec<(Rect, RowItem)>, y: &mut f64, items: &[RowItem]| {
+                    let bw = (w - 8.0 * (items.len() as f64 - 1.0)) / items.len() as f64;
+                    for (i, item) in items.iter().enumerate() {
+                        out.push((Rect::new(x + i as f64 * (bw + 8.0), *y, bw, 36.0), *item));
+                    }
+                    *y += 44.0;
+                };
+                out.push((Rect::new(x, y, 128.0, 30.0), RowItem::AccountsBack));
+                y += 42.0;
+
+                header(&mut out, &mut y, "YOUTUBE MUSIC");
+                let card = if self.yt_account.0.is_empty() && !self.importing && self.account_error.is_none() {
+                    58.0
+                } else {
+                    // Account (photo, name) plus progress bar or message.
+                    104.0
+                };
+                out.push((Rect::new(x, y, w, card), RowItem::AccountInfo(Account::YouTube)));
+                y += card + 6.0;
+                if self.login_browser.is_some() {
+                    if self.accounts_ok {
+                        button(&mut out, &mut y, &[RowItem::GoogleLogin, RowItem::YouTubeDisconnect]);
+                    } else {
+                        button(&mut out, &mut y, &[RowItem::GoogleLogin]);
+                    }
+                } else {
+                    // No Chromium-based browser to sign in with: borrow the
+                    // session of an installed one (works with Firefox).
+                    if self.browsers.is_empty() {
+                        message(&mut out, &mut y, "No encontré navegadores (Firefox, Chrome, Edge, Brave…)");
+                    }
+                    for pair in (0..self.browsers.len()).collect::<Vec<_>>().chunks(2) {
+                        for (j, i) in pair.iter().enumerate() {
+                            out.push((Rect::new(x + j as f64 * (half + 8.0), y, half, 36.0), RowItem::Browser(*i)));
+                        }
+                        y += 44.0;
+                    }
+                    if self.accounts_ok {
+                        button(&mut out, &mut y, &[RowItem::YouTubeLogin, RowItem::YouTubeDisconnect]);
+                    } else {
+                        button(&mut out, &mut y, &[RowItem::YouTubeLogin]);
+                    }
+                }
+                y += 6.0;
+
+                header(&mut out, &mut y, "SPOTIFY");
+                out.push((Rect::new(x, y, w, 58.0), RowItem::AccountInfo(Account::Spotify)));
+                y += 64.0;
+                if self.spotify_search {
+                    button(&mut out, &mut y, &[RowItem::SpotifyKeys, RowItem::SpotifyForget]);
+                } else {
+                    button(&mut out, &mut y, &[RowItem::SpotifyApp, RowItem::SpotifyKeys]);
+                }
+                #[cfg(unix)]
+                button(&mut out, &mut y, &[RowItem::SpotifyPlayback]);
+                let _ = y;
+            }
             Tab::Library => {
                 let half = (w - 8.0) / 2.0;
-                out.push((Rect::new(x, y, half, 36.0), RowItem::Import));
+                let first = if self.accounts_ok { RowItem::Import } else { RowItem::Connect };
+                out.push((Rect::new(x, y, half, 36.0), first));
                 out.push((Rect::new(x + half + 8.0, y, half, 36.0), RowItem::NewPlaylist));
-                y += 46.0;
+                y += 44.0;
+                if self.accounts_ok {
+                    out.push((Rect::new(x, y, w, 36.0), RowItem::Connect));
+                    y += 44.0;
+                }
+                y += 2.0;
                 header(&mut out, &mut y, "TUS LISTAS");
                 if self.playlists.is_empty() {
                     message(&mut out, &mut y, "Importa tus listas de YouTube Music o crea una");
@@ -1211,7 +1401,7 @@ impl App {
                 }
             }
         }
-        if self.entry_mode == EntryMode::NewPlaylist {
+        if self.entry_mode.transient() {
             self.close_entry();
         }
     }
@@ -1326,6 +1516,7 @@ impl App {
                     return;
                 }
                 self.tab = t;
+                self.accounts = false;
                 self.list_scroll = 0.0;
                 if t == Tab::Library {
                     self.refresh_library();
@@ -1450,10 +1641,77 @@ impl App {
                 if self.accounts_ok {
                     self.import_account();
                 } else {
-                    self.open_setup();
+                    self.open_accounts();
                 }
             }
-            RowItem::Connect => self.open_setup(),
+            RowItem::Connect => self.open_accounts(),
+            RowItem::AccountsBack => {
+                self.accounts = false;
+                self.close_entry();
+                self.list_scroll = 0.0;
+                self.refresh_library();
+            }
+            RowItem::Browser(i) => {
+                if let Some((name, spec)) = self.browsers.get(i).cloned() {
+                    paths::set_config("cookies_browser", spec.into());
+                    paths::set_config("cookies_file", "".into());
+                    // Connected only once the import reads the session.
+                    paths::set_config("youtube_account", false.into());
+                    self.sync_accounts();
+                    self.set_status(&format!("Leyendo tu sesión de YouTube en {name}…"));
+                    self.import_account();
+                }
+            }
+            RowItem::YouTubeLogin => {
+                crate::setup::open_url("https://music.youtube.com");
+                self.set_status("Inicia sesión en el navegador y luego elígelo aquí");
+            }
+            RowItem::GoogleLogin => {
+                if !self.logging_in && !self.importing {
+                    self.logging_in = true;
+                    self.account_error = None;
+                    let name = self.login_browser.unwrap_or("el navegador");
+                    self.set_status(&format!(
+                        "Inicia sesión en la ventana de {name} y ciérrala cuando veas YouTube Music"
+                    ));
+                    crate::login::start(self.tx.clone());
+                    // The notch stays on top: shrink it out of the sign-in form's way.
+                    self.collapse();
+                }
+            }
+            RowItem::YouTubeDisconnect => {
+                paths::set_config("youtube_account", false.into());
+                // Forget the signed-in session entirely.
+                if let Some(file) = paths::cookies_file() {
+                    let _ = std::fs::remove_file(file);
+                }
+                paths::set_config("cookies_file", "".into());
+                for key in ["youtube_name", "youtube_handle", "youtube_photo"] {
+                    paths::set_config(key, "".into());
+                }
+                let _ = std::fs::remove_dir_all(crate::login::profile_dir());
+                self.account_error = None;
+                self.sync_accounts();
+                self.set_status("YouTube Music desconectado (tus listas siguen en la Biblioteca)");
+            }
+            RowItem::SpotifyApp => {
+                crate::setup::open_url("https://developer.spotify.com/dashboard/create");
+                self.set_status("Redirect URI: http://127.0.0.1:8888/callback · marca Web API");
+            }
+            RowItem::SpotifyKeys => {
+                if !self.checking_spotify {
+                    self.ask_spotify_key(EntryMode::SpotifyId);
+                }
+            }
+            RowItem::SpotifyForget => {
+                paths::set_config("spotify_client_id", "".into());
+                paths::set_config("spotify_client_secret", "".into());
+                self.spotify_search = spotify_api::configured();
+                self.searched.clear();
+                self.set_status("Claves de Spotify quitadas");
+            }
+            RowItem::SpotifyPlayback => self.open_setup(),
+            RowItem::AccountInfo(_) => {}
             RowItem::Back => self.close_detail(),
             RowItem::DetailPlay | RowItem::DetailShuffle => {
                 if let Some(d) = self.detail.clone() {
@@ -2004,6 +2262,9 @@ impl App {
             self.expand();
         }
         self.tab = Tab::Search;
+        if self.entry_mode.transient() {
+            self.close_entry();
+        }
         if self.detail_here() {
             return;
         }
@@ -2033,9 +2294,84 @@ impl App {
         });
     }
 
-    fn new_playlist(&mut self) {
+    fn sync_accounts(&mut self) {
+        self.accounts_ok = crate::setup::accounts_configured();
+        self.yt_browser = crate::setup::connected_browser();
+        self.yt_google = paths::cookies_file().is_some();
+        let cfg = paths::config();
+        let get = |k: &str| cfg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        self.yt_account = if self.yt_google {
+            (get("youtube_name"), get("youtube_handle"), get("youtube_photo"))
+        } else {
+            Default::default()
+        };
+    }
+
+    /// Library → Cuentas: connect YouTube Music and Spotify without a terminal.
+    fn open_accounts(&mut self) {
+        if !self.expanded {
+            self.expand();
+        }
+        self.close_entry();
         self.tab = Tab::Library;
         self.detail = None;
+        self.accounts = true;
+        self.list_scroll = 0.0;
+        self.browsers = crate::setup::browsers();
+        self.login_browser = crate::login::browser().map(|(name, _)| name);
+        self.sync_accounts();
+        self.spotify_search = spotify_api::configured();
+        self.dirty = true;
+    }
+
+    /// Ask for the Spotify Client ID, then the secret, in the entry.
+    fn ask_spotify_key(&mut self, mode: EntryMode) {
+        self.entry_mode = mode;
+        let (hint, visible) = match mode {
+            EntryMode::SpotifyId => ("Client ID de tu app de Spotify y Enter…", true),
+            _ => ("Client secret y Enter…", false),
+        };
+        self.entry.set_placeholder_text(Some(hint));
+        self.entry.set_primary_icon_name(None);
+        self.entry.set_visibility(visible);
+        self.entry.set_text("");
+        self.entry_shown = false;
+        self.dirty = true;
+    }
+
+    fn spotify_key_entered(&mut self) {
+        let text = self.entry.text().trim().to_string();
+        if text.is_empty() {
+            self.close_entry();
+            return;
+        }
+        if self.entry_mode == EntryMode::SpotifyId {
+            self.spotify_id = text;
+            self.ask_spotify_key(EntryMode::SpotifySecret);
+            return;
+        }
+        let id = std::mem::take(&mut self.spotify_id);
+        self.close_entry();
+        self.checking_spotify = true;
+        self.set_status("Comprobando las claves de Spotify…");
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            paths::set_config("spotify_client_id", id.into());
+            paths::set_config("spotify_client_secret", text.into());
+            let result = spotify_api::search("Bohemian Rhapsody").map(|t| t.len()).map_err(|e| e.to_string());
+            if !matches!(result, Ok(n) if n > 0) {
+                paths::set_config("spotify_client_id", "".into());
+                paths::set_config("spotify_client_secret", "".into());
+            }
+            let _ = tx.send(Event::SpotifyChecked(result));
+        });
+    }
+
+    fn new_playlist(&mut self) {
+        self.close_entry();
+        self.tab = Tab::Library;
+        self.detail = None;
+        self.accounts = false;
         self.entry_mode = EntryMode::NewPlaylist;
         self.entry.set_placeholder_text(Some("Nombre de la nueva lista y Enter…"));
         self.entry.set_text("");
@@ -2044,9 +2380,11 @@ impl App {
     }
 
     fn close_entry(&mut self) {
-        if self.entry_mode == EntryMode::NewPlaylist {
+        if self.entry_mode.transient() {
             self.entry.set_text("");
         }
+        self.entry.set_visibility(true);
+        self.entry.set_primary_icon_name(Some("system-search-symbolic"));
         self.entry_mode = EntryMode::Hidden;
         self.entry.set_visible(false);
         self.entry_shown = false;
@@ -2059,7 +2397,7 @@ impl App {
             && self.anim > 0.95
             && self.entry_mode != EntryMode::Hidden
             && !(self.tab == Tab::Search && self.detail_here())
-            && (self.tab == Tab::Search || self.entry_mode == EntryMode::NewPlaylist);
+            && (self.tab == Tab::Search || self.entry_mode.transient());
         if want {
             let l = self.layout();
             let k = self.ui_scale;
@@ -2212,22 +2550,10 @@ impl App {
         if refresh {
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let list_id = remote.strip_prefix("VL").unwrap_or(&remote).to_string();
-                // Public lists come straight from YouTube Music; private ones
-                // (and "Liked music") need the browser session via yt-dlp.
-                let mut tracks = Vec::new();
-                if list_id != "LM" {
-                    tracks = ytm::collection(&remote).map(|r| r.1).unwrap_or_default();
-                }
-                if tracks.is_empty() && remote.starts_with("VL") {
-                    let url = format!("https://music.youtube.com/playlist?list={list_id}");
-                    match yt::playlist(&url) {
-                        Ok(t) => tracks = t,
-                        Err(e) => {
-                            let _ = tx.send(Event::Error(format!("No se pudo leer la lista: {e}")));
-                        }
-                    }
-                }
+                let tracks = remote_tracks(&remote).unwrap_or_else(|e| {
+                    let _ = tx.send(Event::Error(format!("No se pudo leer la lista: {e}")));
+                    Vec::new()
+                });
                 let _ = tx.send(Event::CollectionDone(key, String::new(), tracks));
             });
         }
@@ -2267,7 +2593,27 @@ impl App {
         }
     }
 
+    /// Run `marmota-music setup` in a new console window.
+    #[cfg(windows)]
+    fn open_setup(&mut self) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
+        let spawned = std::process::Command::new("cmd")
+            .args(["/C", "start", "Marmota Music"])
+            .arg(exe)
+            .arg("setup")
+            .env("MM_SETUP_WAIT", "1")
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                self.set_status("Sigue los pasos en la terminal");
+                self.collapse();
+            }
+            Err(e) => self.set_status(&format!("No pude abrir la terminal: {e}")),
+        }
+    }
+
     /// Run `marmota-music setup` in a floating terminal.
+    #[cfg(unix)]
     fn open_setup(&mut self) {
         let omarchy = "omarchy-launch-floating-terminal-with-presentation";
         let has_omarchy = std::process::Command::new("sh")
@@ -2297,16 +2643,12 @@ impl App {
             return;
         }
         self.importing = true;
-        self.set_status("Importando tus listas de YouTube Music…");
+        self.account_error = None;
+        self.import_progress = Some((0, 0, "Leyendo tu cuenta…".into()));
+        self.dirty = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = yt::account_playlists().map_err(|e| e.to_string()).and_then(|lists| {
-                let db = Db::open().map_err(|e| e.to_string())?;
-                for (id, title) in &lists {
-                    let _ = db.upsert_remote_playlist(title, &format!("VL{id}"), "");
-                }
-                Ok(lists.len())
-            });
+            let result = import(&tx);
             let _ = tx.send(Event::ImportDone(result));
         });
     }
@@ -2333,7 +2675,7 @@ impl App {
     }
 
     fn refresh_library(&mut self) {
-        self.accounts_ok = crate::setup::accounts_configured();
+        self.sync_accounts();
         self.library = self.db.library();
         self.history = self.db.history(25);
         self.playlists = self.db.playlists();
@@ -2434,14 +2776,66 @@ impl App {
                 self.thumbs.borrow_mut().insert(url, surf);
                 self.dirty = true;
             }
+            Event::ImportProgress(done, total, label) => {
+                self.import_progress = Some((done, total, label));
+                // Show the account as soon as it is known, and each list as
+                // it lands in the library.
+                self.sync_accounts();
+                self.refresh_library();
+                self.dirty = true;
+            }
             Event::ImportDone(result) => {
                 self.importing = false;
+                self.import_progress = None;
+                self.refresh_library();
                 match result {
-                    Ok(n) => {
-                        self.refresh_library();
-                        self.set_status(&format!("{n} listas importadas de YouTube Music"));
+                    Ok((n, 0)) => self.set_status(&format!("Listo: {n} listas importadas de YouTube Music")),
+                    Ok((n, failed)) => self.set_status(&format!(
+                        "{n} listas importadas; {failed} no se pudieron leer (ábrelas para reintentar)"
+                    )),
+                    Err(e) => {
+                        let msg = if self.yt_google {
+                            format!("No pude leer tu cuenta: {e}. Pulsa «Volver a iniciar sesión».")
+                        } else {
+                            format!(
+                                "No vi tu sesión ({e}). Inicia sesión en YouTube Music en ese navegador{} y vuelve a elegirlo.",
+                                if cfg!(windows) { ", ciérralo" } else { "" }
+                            )
+                        };
+                        self.set_status(&msg);
+                        self.account_error = Some(msg);
                     }
-                    Err(e) => self.set_status(&format!("No se pudo importar: {e}")),
+                }
+                self.dirty = true;
+            }
+            Event::LoginDone(result) => {
+                self.logging_in = false;
+                // Back to the accounts view to show how it went.
+                self.open_accounts();
+                match result {
+                    Ok(file) => {
+                        paths::set_config("cookies_file", file.display().to_string().into());
+                        // Connected once the import has read the account.
+                        paths::set_config("youtube_account", false.into());
+                        self.sync_accounts();
+                        self.set_status("Sesión iniciada: importando tus listas…");
+                        self.import_account();
+                    }
+                    Err(e) => {
+                        self.set_status(&e);
+                        self.account_error = Some(e);
+                    }
+                }
+                self.dirty = true;
+            }
+            Event::SpotifyChecked(result) => {
+                self.checking_spotify = false;
+                self.spotify_search = spotify_api::configured();
+                self.searched.clear();
+                match result {
+                    Ok(n) if n > 0 => self.set_status("Búsqueda en Spotify conectada"),
+                    Ok(_) => self.set_status("Spotify respondió sin resultados: revisa las claves"),
+                    Err(e) => self.set_status(&format!("{e}: revisa el Client ID y el secret")),
                 }
             }
             Event::Substitute(sp_id, twin) => {
@@ -2584,6 +2978,7 @@ impl App {
 
     /// Focused output as reported by Hyprland: connector, logical origin and
     /// logical height.
+    #[cfg(unix)]
     fn focused_output() -> Option<(String, f64, f64, f64)> {
         let out = std::process::Command::new("hyprctl")
             .args(["-j", "monitors"])
@@ -2606,6 +3001,7 @@ impl App {
     }
 
     /// Pick the GDK monitor that matches the focused Hyprland output.
+    #[cfg(unix)]
     fn gdk_monitor_named(x: f64, y: f64) -> Option<gtk::gdk::Monitor> {
         let display = gtk::gdk::Display::default()?;
         let list = display.monitors();
@@ -2623,6 +3019,22 @@ impl App {
     /// Point the layer surface at the focused output and scale it against that
     /// output's logical height, so the notch neither swamps a 1080p laptop
     /// panel nor looks tiny on a 4K one.
+    #[cfg(windows)]
+    fn place(&mut self) {
+        // The HWND (and its scale) exist only once the window is realized.
+        gtk::prelude::WidgetExt::realize(&self.window);
+        crate::win::hide_from_taskbar(&self.window);
+        let mut k = 1.0;
+        if let Some(logical) = crate::win::pointer_monitor_height(&self.window) {
+            if logical > 100.0 {
+                k = (logical / 1080.0).clamp(0.70, 1.0);
+            }
+        }
+        self.ui_scale = k;
+        self.sync_size();
+    }
+
+    #[cfg(unix)]
     fn place(&mut self) {
         let focused = Self::focused_output();
         let mut k = 1.0;
@@ -2664,6 +3076,14 @@ impl App {
         self.hiding = false;
         self.place();
         self.window.present();
+        #[cfg(windows)]
+        {
+            // GTK sizes and positions a new window after present(); move it
+            // once now and again when the size has settled.
+            crate::win::place(&self.window);
+            let window = self.window.clone();
+            glib::timeout_add_local_once(Duration::from_millis(80), move || crate::win::place(&window));
+        }
         // A (re)mapped surface starts with a full input region.
         self.input_rect = (-1, -1, -1, -1);
         self.sync_input_region();
@@ -2685,7 +3105,7 @@ impl App {
 
     fn collapse(&mut self) {
         self.expanded = false;
-        if self.entry_mode == EntryMode::NewPlaylist {
+        if self.entry_mode.transient() {
             self.close_entry();
         }
         self.start_anim(0.0);
@@ -2697,7 +3117,7 @@ impl App {
         }
         self.hiding = true;
         self.expanded = false;
-        if self.entry_mode == EntryMode::NewPlaylist {
+        if self.entry_mode.transient() {
             self.close_entry();
         }
         if self.anim <= 0.01 {
@@ -2772,6 +3192,10 @@ impl App {
     fn tick(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             self.handle_event(ev);
+        }
+        // The accounts card animates its bar until there is a count.
+        if self.accounts && self.visible && self.import_progress.as_ref().is_some_and(|p| p.1 == 0) {
+            self.dirty = true;
         }
 
         let (mut pos, mut dur, mut playing, has_video) = {

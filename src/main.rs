@@ -1,5 +1,6 @@
 mod db;
 mod draw;
+mod login;
 mod lyrics;
 mod model;
 mod mpv;
@@ -10,11 +11,12 @@ mod spotify;
 mod spotify_api;
 mod theme;
 mod ui;
+#[cfg(windows)]
+mod win;
 mod yt;
 mod ytm;
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,13 +70,15 @@ enum Action {
     /// Print ranked search results (diagnostics).
     #[command(hide = true)]
     SearchTest { query: String },
+    /// Show the YouTube account the saved session belongs to (diagnostics).
+    #[command(hide = true)]
+    AccountTest,
     /// Open the search tab, optionally running a query.
     Search { query: Option<String> },
 }
 
 fn request(cmd: &Cmd) -> Option<String> {
-    let path = paths::socket();
-    let mut stream = UnixStream::connect(path).ok()?;
+    let mut stream = local::connect().ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(600))).ok()?;
     let body = serde_json::to_string(cmd).ok()?;
     stream.write_all(body.as_bytes()).ok()?;
@@ -92,7 +96,13 @@ fn request(cmd: &Cmd) -> Option<String> {
 
 fn spawn_daemon() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
+        let mut cmd = std::process::Command::new(exe);
+        #[cfg(windows)]
+        {
+            win::no_console(&mut cmd);
+            win::keep_stdio_private();
+        }
+        let _ = cmd
             .arg("daemon")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -137,9 +147,15 @@ fn main() {
                 eprintln!("marmota-music: ya hay una instancia en ejecución");
                 return;
             }
+            // Started from a shortcut or a terminal: let go of the console
+            // so no black window stays open next to the notch.
+            #[cfg(windows)]
+            win::detach_console();
             let shared = Arc::new(Mutex::new(Snapshot::default()));
             let (tx, rx) = std::sync::mpsc::channel();
             ipc::start(tx.clone(), shared.clone());
+            #[cfg(windows)]
+            win::hotkey(tx.clone());
             if let Err(e) = ui::run(rx, tx, shared) {
                 eprintln!("marmota-music: {e}");
                 std::process::exit(1);
@@ -168,6 +184,13 @@ fn main() {
         Action::Refresh => {
             let _ = request(&Cmd::Refresh);
         }
+        Action::AccountTest => match paths::cookies_file() {
+            Some(file) => match ytm::account(&file) {
+                Ok((name, email, photo)) => println!("{name} · {email} · foto: {}", !photo.is_empty()),
+                Err(e) => println!("error: {e}"),
+            },
+            None => println!("sin sesión guardada"),
+        },
         Action::SearchTest { query } => {
             let yt = ytm::search(&query).map(|r| r.0).unwrap_or_default();
             let sp = spotify_api::search(&query).unwrap_or_default();
@@ -185,20 +208,57 @@ fn main() {
     }
 }
 
+/// Transport of the control socket: a Unix socket, or on Windows a loopback
+/// TCP port published in a file (std has no Unix sockets there).
+mod local {
+    use std::io;
+
+    #[cfg(windows)]
+    pub use std::net::{TcpListener as Listener, TcpStream as Stream};
+    #[cfg(unix)]
+    pub use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
+
+    #[cfg(unix)]
+    pub fn connect() -> io::Result<Stream> {
+        Stream::connect(crate::paths::socket())
+    }
+
+    #[cfg(windows)]
+    pub fn connect() -> io::Result<Stream> {
+        let port: u16 = std::fs::read_to_string(crate::paths::socket())?
+            .trim()
+            .parse()
+            .map_err(|_| io::Error::other("puerto inválido"))?;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        Stream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+    }
+
+    pub fn bind() -> io::Result<Listener> {
+        let path = crate::paths::socket();
+        let _ = std::fs::remove_file(&path);
+        #[cfg(unix)]
+        return Listener::bind(&path);
+        #[cfg(windows)]
+        {
+            let listener = Listener::bind(("127.0.0.1", 0))?;
+            std::fs::write(&path, listener.local_addr()?.port().to_string())?;
+            Ok(listener)
+        }
+    }
+}
+
 mod ipc {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
+    use crate::local::{self, Stream};
     use crate::model::{Cmd, Event, Snapshot};
 
     pub fn start(tx: Sender<Event>, shared: Arc<Mutex<Snapshot>>) {
-        let path = crate::paths::socket();
-        let _ = std::fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
+        let listener = match local::bind() {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("marmota-music: socket: {e}");
@@ -218,7 +278,7 @@ mod ipc {
             .ok();
     }
 
-    fn handle(mut stream: UnixStream, tx: Sender<Event>, shared: Arc<Mutex<Snapshot>>) {
+    fn handle(mut stream: Stream, tx: Sender<Event>, shared: Arc<Mutex<Snapshot>>) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
         let mut line = String::new();
         let mut reader = match stream.try_clone() {

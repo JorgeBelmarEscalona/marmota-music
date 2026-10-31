@@ -1,6 +1,6 @@
 //! First-run assistant (`marmota-music setup`): connects YouTube Music and
-//! Spotify step by step. Runs in a terminal; the installer and the
-//! "Conectar cuentas" button in the library both open it.
+//! Spotify step by step in a terminal; the installer opens it. The notch
+//! does the same from its "Cuentas" view, reusing the helpers here.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -43,14 +43,24 @@ fn step(n: u8, title: &str) {
     println!("\n{A}{B}{n} · {title}{X}");
 }
 
-fn open_url(url: &str) {
-    let _ = Command::new("xdg-open")
+pub fn open_url(url: &str) {
+    // `cmd /C start` would split the URL at every `&`.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(unix)]
+    let mut cmd = Command::new("xdg-open");
+    let _ = cmd
         .arg(url)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
 }
 
+#[cfg(unix)]
 fn has(cmd: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {cmd}")])
@@ -60,7 +70,29 @@ fn has(cmd: &str) -> bool {
 }
 
 /// Browsers with a profile on this machine, as yt-dlp `--cookies-from-browser` specs.
-fn browsers() -> Vec<(&'static str, String)> {
+#[cfg(windows)]
+pub fn browsers() -> Vec<(&'static str, String)> {
+    let roaming = dirs::config_dir().unwrap_or_default();
+    let local = dirs::data_local_dir().unwrap_or_default();
+    let candidates: [(&str, PathBuf, String); 7] = [
+        ("Firefox", roaming.join(r"Mozilla\Firefox"), "firefox".into()),
+        ("Zen", roaming.join("zen"), format!("firefox:{}", roaming.join("zen").display())),
+        ("Google Chrome", local.join(r"Google\Chrome\User Data"), "chrome".into()),
+        ("Microsoft Edge", local.join(r"Microsoft\Edge\User Data"), "edge".into()),
+        ("Brave", local.join(r"BraveSoftware\Brave-Browser\User Data"), "brave".into()),
+        ("Vivaldi", local.join(r"Vivaldi\User Data"), "vivaldi".into()),
+        ("Chromium", local.join(r"Chromium\User Data"), "chromium".into()),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, dir, _)| dir.exists())
+        .map(|(name, _, spec)| (name, spec))
+        .collect()
+}
+
+/// Browsers with a profile on this machine, as yt-dlp `--cookies-from-browser` specs.
+#[cfg(unix)]
+pub fn browsers() -> Vec<(&'static str, String)> {
     let home = dirs::home_dir().unwrap_or_default();
     let cfg = dirs::config_dir().unwrap_or_default();
     let candidates: [(&str, PathBuf, String); 7] = [
@@ -94,6 +126,11 @@ fn youtube() {
         return;
     }
     println!("  ¿En qué navegador tienes la sesión de YouTube iniciada?");
+    #[cfg(windows)]
+    println!(
+        "  {D}En Windows, Firefox es el más fiable: Chrome, Edge y Brave cifran sus cookies\n  \
+         y yt-dlp a veces no puede leerlas (ciérralos antes de importar).{X}"
+    );
     for (i, (name, _)) in found.iter().enumerate() {
         println!("    {B}{}{X}) {name}", i + 1);
     }
@@ -127,6 +164,7 @@ fn youtube() {
     }
 }
 
+#[cfg(unix)]
 fn spotifyd_conf() {
     let dir = dirs::config_dir().unwrap_or_default().join("spotifyd");
     let file = dir.join("spotifyd.conf");
@@ -149,6 +187,15 @@ fn spotifyd_conf() {
     ok(&format!("Configuración de spotifyd creada en {}", file.display()));
 }
 
+/// spotifyd plays through MPRIS (D-Bus), which Windows does not have.
+#[cfg(windows)]
+fn spotify_playback() {
+    println!("\n  {B}Reproducir desde Spotify{X}");
+    println!("  {D}En Windows las canciones de Spotify suenan desde YouTube Music (la búsqueda");
+    println!("  en Spotify funciona igual).{X}");
+}
+
+#[cfg(unix)]
 fn spotify_playback() {
     println!("\n  {B}Reproducir desde Spotify{X} {D}(requiere Premium){X}");
     let creds = dirs::cache_dir().unwrap_or_default().join("spotifyd/oauth/credentials.json");
@@ -245,7 +292,17 @@ fn spotify() {
     spotify_playback();
 }
 
+/// Keyboard shortcut that opens the notch on this platform.
+pub fn shortcut() -> String {
+    #[cfg(windows)]
+    return crate::win::hotkey_label();
+    #[cfg(unix)]
+    "Super + Shift + M".into()
+}
+
 pub fn run(only: Option<&str>) {
+    #[cfg(windows)]
+    crate::win::enable_ansi();
     match only {
         Some("spotify") => {
             spotify_playback();
@@ -263,9 +320,10 @@ pub fn run(only: Option<&str>) {
     spotify();
     paths::set_config("setup_done", true.into());
     step(3, "Listo");
-    println!("  Abre el reproductor con {B}Super + Shift + M{X}.");
+    println!("  Abre el reproductor con {B}{}{X}.", shortcut());
     // Tell a running notch to pick up the new lists.
-    let _ = Command::new("marmota-music")
+    let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
+    let _ = Command::new(exe)
         .arg("refresh")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -284,5 +342,15 @@ pub fn accounts_configured() -> bool {
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
     let declined = c.get("youtube_account").and_then(|v| v.as_bool()) == Some(false);
-    browser && !declined
+    (browser || paths::cookies_file().is_some()) && !declined
+}
+
+/// Display name of the browser whose session is configured, if detected
+/// (none when signed in with Google from the notch).
+pub fn connected_browser() -> Option<&'static str> {
+    if paths::cookies_file().is_some() {
+        return None;
+    }
+    let spec = paths::config().get("cookies_browser")?.as_str()?.to_string();
+    browsers().into_iter().find(|(_, s)| *s == spec).map(|(name, _)| name)
 }

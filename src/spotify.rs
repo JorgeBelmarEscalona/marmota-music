@@ -4,14 +4,23 @@
 //! (`spotifyd`, or the official client). This module polls its MPRIS
 //! interface, keeps a snapshot of what is playing and forwards transport
 //! commands, so the notch can drive Spotify exactly like it drives mpv.
+//!
+//! Windows has no MPRIS: there Spotify never shows up as available and its
+//! songs play from YouTube Music, as on Linux without spotifyd.
 
-use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::sync::mpsc::RecvTimeoutError;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
 use zbus::blocking::{Connection, Proxy};
+#[cfg(unix)]
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
 #[derive(Clone, Default)]
@@ -31,6 +40,7 @@ pub struct State {
     pub volume: f64,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub enum Cmd {
     #[allow(dead_code)]
     Play,
@@ -67,9 +77,11 @@ impl Spotify {
     }
 }
 
+#[cfg(unix)]
 type Client = (Connection, Proxy<'static>, Proxy<'static>);
 
 /// Bus name of spotifyd's own control interface, present even while idle.
+#[cfg(unix)]
 fn spotifyd_controls() -> Option<(Connection, String)> {
     let conn = Connection::session().ok()?;
     let dbus = Proxy::new(&conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").ok()?;
@@ -79,6 +91,7 @@ fn spotifyd_controls() -> Option<(Connection, String)> {
 }
 
 /// Make the idle spotifyd the active device so it exposes MPRIS.
+#[cfg(unix)]
 fn activate() -> Option<Client> {
     let (conn, name) = spotifyd_controls()?;
     let ctl = Proxy::new(&conn, name, "/rs/spotifyd/Controls", "rs.spotifyd.Controls").ok()?;
@@ -92,6 +105,7 @@ fn activate() -> Option<Client> {
     None
 }
 
+#[cfg(unix)]
 fn connect() -> Option<Client> {
     let conn = Connection::session().ok()?;
     let dbus = Proxy::new(
@@ -125,6 +139,7 @@ fn connect() -> Option<Client> {
     Some((conn, proxy, props))
 }
 
+#[cfg(unix)]
 fn text(v: Option<&OwnedValue>) -> String {
     match v {
         Some(v) => String::try_from(v.clone()).unwrap_or_default(),
@@ -132,6 +147,7 @@ fn text(v: Option<&OwnedValue>) -> String {
     }
 }
 
+#[cfg(unix)]
 fn trackid(v: Option<&OwnedValue>) -> String {
     let Some(v) = v else { return String::new() };
     if let Ok(s) = String::try_from(v.clone()) {
@@ -143,6 +159,7 @@ fn trackid(v: Option<&OwnedValue>) -> String {
     String::new()
 }
 
+#[cfg(unix)]
 fn number(v: Option<&OwnedValue>) -> f64 {
     let Some(v) = v else { return 0.0 };
     if let Ok(n) = i64::try_from(v.clone()) {
@@ -157,6 +174,7 @@ fn number(v: Option<&OwnedValue>) -> f64 {
     0.0
 }
 
+#[cfg(unix)]
 fn prop<T>(props: &Proxy<'static>, name: &str) -> Option<T>
 where
     T: TryFrom<OwnedValue>,
@@ -167,6 +185,7 @@ where
     T::try_from(v).ok()
 }
 
+#[cfg(unix)]
 fn poll(props: &Proxy<'static>, prev: &State) -> Option<State> {
     let status: String = prop(props, "PlaybackStatus")?;
     let meta: HashMap<String, OwnedValue> = prop(props, "Metadata")?;
@@ -194,6 +213,7 @@ fn poll(props: &Proxy<'static>, prev: &State) -> Option<State> {
     })
 }
 
+#[cfg(unix)]
 fn apply(proxy: &Proxy<'static>, cmd: Cmd, state: &State) -> bool {
     match cmd {
         Cmd::Play => proxy.call_method("Play", &()).is_ok(),
@@ -217,6 +237,12 @@ fn apply(proxy: &Proxy<'static>, cmd: Cmd, state: &State) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn run(rx: Receiver<Cmd>, _st: Arc<Mutex<State>>) {
+    while rx.recv().is_ok() {}
+}
+
+#[cfg(unix)]
 fn run(rx: Receiver<Cmd>, st: Arc<Mutex<State>>) {
     let mut client: Option<Client> = None;
     loop {

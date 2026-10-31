@@ -1,6 +1,6 @@
 # Marmota Music
 
-Reproductor de música nativo para Omarchy/Hyprland: una barra flotante tipo
+Reproductor de música nativo para Omarchy/Hyprland y Windows: una barra flotante tipo
 *notch* en la parte inferior de la pantalla, con estética de vidrio, portada,
 letras sincronizadas, vídeo dentro del notch y controles completos.
 Busca y reproduce desde **YouTube Music** y **Spotify**.
@@ -8,8 +8,8 @@ Busca y reproduce desde **YouTube Music** y **Spotify**.
 ![Vídeo y letra sincronizada](docs/video-letra.png)
 ![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
 
-- **Abrir/cerrar:** `Super + Shift + M` (o `marmota-music toggle`)
-- **Instalar:** `./install.sh` (ver [Instalar](#instalar))
+- **Abrir/cerrar:** `Super + Shift + M` (en Windows `Win + Alt + M`), o `marmota-music toggle`
+- **Instalar:** `./install.sh` (ver [Instalar](#instalar)); en Windows, `install.ps1` (ver [Windows](#windows))
 - Hecho en Rust + GTK4, pensado para gastar poco: ~1 % de CPU contraído.
 
 ## Uso
@@ -26,7 +26,8 @@ Busca y reproduce desde **YouTube Music** y **Spotify**.
 | Ver el videoclip dentro del notch | botón ▶▭ junto a *Guardar*, o `v` |
 | Guardar en la biblioteca | botón *Guardar* |
 | Crear lista | Biblioteca → *Nueva lista* |
-| Importar tus listas de YouTube Music | Biblioteca → *Importar de YouTube Music* (usa la sesión del navegador; se configura en `~/.config/marmota-music/config.json`, clave `cookies_browser`) |
+| Conectar YouTube Music / Spotify | Biblioteca → *Cuentas* (ver [Conectar cuentas](#conectar-cuentas)) |
+| Importar tus listas de YouTube Music | Biblioteca → *Importar de YouTube Music* (usa la sesión del navegador elegido en *Cuentas*) |
 | Reproducir a continuación / quitar de la cola | botones que aparecen al pasar el ratón por una fila |
 
 La píldora mini muestra la línea actual de la letra y la siguiente, además de
@@ -89,8 +90,29 @@ El instalador:
 
 ### Conectar cuentas
 
-`marmota-music setup` (o el botón *Conectar cuentas* de la Biblioteca)
-pregunta paso a paso:
+Desde el propio notch, sin terminal (Linux y Windows): **Biblioteca →
+Cuentas**.
+
+- **YouTube Music:** *Iniciar sesión con Google* abre una ventana de Chrome,
+  Edge, Chromium o Brave con un perfil propio de Marmota, en la página de
+  inicio de sesión de Google. Inicia sesión y **cierra esa ventana** cuando
+  veas YouTube Music. Es una ventana normal: Google no deja iniciar sesión en
+  un navegador con depuración remota. Después el notch abre ese perfil sin
+  ventana, con DevTools, solo para leer la sesión (así no le afecta el
+  cifrado de cookies de Chrome en Windows), la guarda como
+  `youtube-cookies.txt` en la carpeta de datos e importa tus listas y tus
+  «Me gusta».
+  *Desconectar* borra esa sesión y el perfil. Sin un navegador Chromium
+  (por ejemplo, solo Firefox), la vista ofrece en su lugar usar la sesión del
+  navegador instalado.
+- **Spotify (búsqueda):** *Crear app en Spotify* abre el panel de
+  desarrolladores; luego *Pegar Client ID y secret* pide ambas claves en el
+  campo de texto (el secret se oculta) y las valida con una búsqueda de
+  prueba.
+- **Spotify (reproducción con Premium, solo Linux):** instalar `spotifyd`
+  necesita `sudo`, así que ese paso abre el asistente en una terminal.
+
+El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
 
 - **YouTube Music:** ¿tienes cuenta? → elige el navegador donde tienes la
   sesión iniciada → importa tus listas y tus «Me gusta».
@@ -100,6 +122,44 @@ pregunta paso a paso:
 
 Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
 Para repetirlo: `marmota-music setup` o `./install.sh --setup`.
+
+## Windows
+
+```powershell
+git clone https://github.com/JorgeBelmarEscalona/marmota-music
+cd marmota-music
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+El instalador:
+
+1. instala [MSYS2](https://www.msys2.org) con `winget` si no está, y desde
+   ahí GTK4, libmpv y Rust (entorno UCRT64); `yt-dlp` también con `winget`;
+2. compila y deja el programa, con las DLL de GTK y mpv que necesita, en
+   `%LOCALAPPDATA%\Programs\MarmotaMusic\bin\marmota-music.exe` (agregado al
+   `PATH` del usuario);
+3. crea el arranque automático (carpeta *Inicio*) y un acceso en el menú
+   Inicio;
+4. arranca el notch y, la primera vez, abre el asistente de cuentas.
+
+Diferencias con Linux:
+
+| | Linux (Hyprland) | Windows |
+| --- | --- | --- |
+| Atajo | `Super + Shift + M` | `Win + Alt + M`; se cambia con la clave `hotkey` del config (p. ej. `"Ctrl + Shift + P"`). Si otro programa ya registró ese atajo, el notch lo captura igual con un hook de teclado |
+| Ventana | capa `gtk4-layer-shell` | ventana sin bordes, siempre encima, fuera de la barra de tareas, centrada sobre la barra de tareas del monitor donde está el puntero |
+| Control externo | socket Unix | puerto TCP en `127.0.0.1` (anotado en `%TEMP%\marmota-music.port`) |
+| IPC con mpv | socket Unix | *named pipe* `\\.\pipe\marmota-music-mpv` |
+| Configuración | `~/.config/marmota-music/config.json` | `%APPDATA%\marmota-music\config.json` |
+| Biblioteca / caché | `~/.local/share`, `~/.cache` | `%APPDATA%\marmota-music`, `%LOCALAPPDATA%\marmota-music` |
+| Spotify | búsqueda + reproducción con spotifyd | solo búsqueda; las canciones suenan desde YouTube Music |
+
+Para importar listas de YouTube Music, Firefox es el navegador más fiable en
+Windows: Chrome, Edge y Brave cifran sus cookies y `yt-dlp` a veces no puede
+leerlas.
+
+Para compilar a mano: en una terminal *MSYS2 UCRT64*, `pacman -S
+mingw-w64-ucrt-x86_64-{gtk4,mpv,rust,pkgconf,gcc}` y `cargo build --release`.
 
 ## Spotify
 
