@@ -1,6 +1,4 @@
 use std::ffi::{c_char, c_int, c_void, CString};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -49,6 +47,153 @@ mod ffi {
         );
         pub fn mpv_render_context_update(ctx: *mut c_void) -> u64;
         pub fn mpv_render_context_render(ctx: *mut c_void, params: *mut RenderParam) -> c_int;
+    }
+}
+
+/// Client end of mpv's JSON IPC: one line-oriented connection whose reads
+/// give up after a short wait, so the command loop keeps turning.
+#[cfg(unix)]
+mod ipc {
+    use std::io::{self, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::time::Duration;
+
+    pub struct Conn(UnixStream);
+
+    impl Conn {
+        pub fn connect(path: &Path) -> io::Result<Self> {
+            let s = UnixStream::connect(path)?;
+            s.set_read_timeout(Some(Duration::from_millis(40)))?;
+            Ok(Self(s))
+        }
+
+        pub fn write_line(&mut self, line: &[u8]) {
+            let _ = self.0.write_all(line);
+            let _ = self.0.write_all(b"\n");
+        }
+
+        pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+}
+
+/// On Windows mpv serves a named pipe. A synchronous pipe handle serializes
+/// I/O (a pending read would block every write), so the pipe is opened
+/// overlapped and reads wait on an event with a timeout instead.
+#[cfg(windows)]
+mod ipc {
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, HANDLE, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+
+    const BUF: usize = 8192;
+
+    pub struct Conn {
+        pipe: File,
+        // Boxed: the kernel writes into these while a read is pending.
+        read_ov: Box<OVERLAPPED>,
+        read_buf: Box<[u8; BUF]>,
+        reading: bool,
+        write_ov: Box<OVERLAPPED>,
+    }
+
+    fn event() -> io::Result<HANDLE> {
+        let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if h.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(h)
+        }
+    }
+
+    impl Conn {
+        pub fn connect(path: &Path) -> io::Result<Self> {
+            let pipe = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(path)?;
+            let mut read_ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+            let mut write_ov: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+            read_ov.hEvent = event()?;
+            write_ov.hEvent = event()?;
+            Ok(Self { pipe, read_ov, read_buf: Box::new([0; BUF]), reading: false, write_ov })
+        }
+
+        fn handle(&self) -> HANDLE {
+            self.pipe.as_raw_handle() as HANDLE
+        }
+
+        pub fn write_line(&mut self, line: &[u8]) {
+            let mut data = line.to_vec();
+            data.push(b'\n');
+            let h = self.handle();
+            let mut n = 0u32;
+            unsafe {
+                let ok = WriteFile(h, data.as_ptr(), data.len() as u32, std::ptr::null_mut(), &mut *self.write_ov);
+                if ok != 0 || GetLastError() == ERROR_IO_PENDING {
+                    GetOverlappedResult(h, &*self.write_ov, &mut n, 1);
+                }
+            }
+        }
+
+        pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let h = self.handle();
+            let mut n = 0u32;
+            unsafe {
+                if !self.reading {
+                    let ok = ReadFile(h, self.read_buf.as_mut_ptr(), BUF as u32, std::ptr::null_mut(), &mut *self.read_ov);
+                    if ok == 0 {
+                        match GetLastError() {
+                            ERROR_IO_PENDING => self.reading = true,
+                            ERROR_BROKEN_PIPE => return Ok(0),
+                            _ => return Err(io::Error::last_os_error()),
+                        }
+                    }
+                }
+                if self.reading {
+                    if WaitForSingleObject(self.read_ov.hEvent, 40) != WAIT_OBJECT_0 {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.reading = false;
+                }
+                if GetOverlappedResult(h, &*self.read_ov, &mut n, 0) == 0 {
+                    return match GetLastError() {
+                        ERROR_BROKEN_PIPE => Ok(0),
+                        _ => Err(io::Error::last_os_error()),
+                    };
+                }
+            }
+            let n = (n as usize).min(buf.len());
+            buf[..n].copy_from_slice(&self.read_buf[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Drop for Conn {
+        fn drop(&mut self) {
+            let h = self.handle();
+            unsafe {
+                if self.reading {
+                    let mut n = 0u32;
+                    CancelIoEx(h, &*self.read_ov);
+                    GetOverlappedResult(h, &*self.read_ov, &mut n, 1);
+                }
+                CloseHandle(self.read_ov.hEvent);
+                CloseHandle(self.write_ov.hEvent);
+            }
+        }
     }
 }
 
@@ -135,10 +280,12 @@ impl Mpv {
     pub fn new(shared: Arc<Mutex<Playback>>, events: Sender<Event>) -> Self {
         let sock = crate::paths::mpv_socket();
         // An older daemon (or the old external mpv) may still own the socket.
-        if let Ok(mut stale) = UnixStream::connect(&sock) {
-            let _ = stale.write_all(b"{\"command\":[\"quit\"]}\n");
+        if let Ok(mut stale) = ipc::Conn::connect(&sock) {
+            stale.write_line(b"{\"command\":[\"quit\"]}");
+            drop(stale);
             thread::sleep(Duration::from_millis(200));
         }
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&sock);
 
         let frame: SharedFrame = Arc::new(Mutex::new(Frame {
@@ -233,25 +380,23 @@ impl Mpv {
     }
 }
 
-fn send(stream: &mut UnixStream, id: &mut u64, cmd: Value) {
+fn send(stream: &mut ipc::Conn, id: &mut u64, cmd: Value) {
     *id += 1;
     let body = json!({ "command": cmd, "request_id": *id });
-    let _ = stream.write_all(body.to_string().as_bytes());
-    let _ = stream.write_all(b"\n");
+    stream.write_line(body.to_string().as_bytes());
 }
 
 fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playback>>, events: Sender<Event>) {
     // mpv needs a moment to create its IPC socket.
     let mut stream = None;
     for _ in 0..80 {
-        if let Ok(s) = UnixStream::connect(&sock) {
+        if let Ok(s) = ipc::Conn::connect(&sock) {
             stream = Some(s);
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
     let Some(mut stream) = stream else { return };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(40)));
 
     let mut rid = 0u64;
     for (i, prop) in [

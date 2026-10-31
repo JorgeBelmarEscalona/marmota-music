@@ -5,7 +5,7 @@ use gtk::pango;
 
 use crate::model::{CollKind, Rect, Source, Track};
 use crate::theme::{self, Rgb};
-use crate::ui::{App, Hit, List, RowItem, Tab};
+use crate::ui::{Account, App, Hit, List, RowItem, Tab};
 
 #[allow(dead_code)]
 const PAD: f64 = 0.0;
@@ -37,7 +37,7 @@ fn label(
 ) -> f64 {
     let layout = pangocairo::functions::create_layout(cr);
     let mut fd = pango::FontDescription::new();
-    fd.set_family("Noto Sans");
+    fd.set_family("Noto Sans, Segoe UI");
     fd.set_absolute_size(size * pango::SCALE as f64);
     fd.set_weight(weight);
     layout.set_font_description(Some(&fd));
@@ -65,7 +65,7 @@ fn label_center(
 ) {
     let layout = pangocairo::functions::create_layout(cr);
     let mut fd = pango::FontDescription::new();
-    fd.set_family("Noto Sans");
+    fd.set_family("Noto Sans, Segoe UI");
     fd.set_absolute_size(size * pango::SCALE as f64);
     fd.set_weight(weight);
     layout.set_font_description(Some(&fd));
@@ -93,7 +93,7 @@ fn para(
 ) -> f64 {
     let layout = pangocairo::functions::create_layout(cr);
     let mut fd = pango::FontDescription::new();
-    fd.set_family("Noto Sans");
+    fd.set_family("Noto Sans, Segoe UI");
     fd.set_absolute_size(size * pango::SCALE as f64);
     fd.set_weight(weight);
     layout.set_font_description(Some(&fd));
@@ -578,7 +578,7 @@ impl App {
             .track
             .as_ref()
             .map(|t| t.subtitle())
-            .unwrap_or_else(|| "Super + Shift + M".into());
+            .unwrap_or_else(crate::setup::shortcut);
         label(cr, &title, l.title.x, l.title.y, l.title.w, 14.0, pango::Weight::Semibold, theme::TEXT, a);
         label(cr, &artist, l.artist.x, l.artist.y, l.artist.w, 11.0, pango::Weight::Normal, theme::MUTED, 0.72 * a);
 
@@ -1053,6 +1053,139 @@ impl App {
         }
     }
 
+    /// Accounts view, YouTube Music signed in or on its way: photo, name and
+    /// handle, then the import's progress, the error, or what is in the library.
+    fn youtube_card(&self, cr: &Context, r: Rect, a: f64) {
+        const OK: Rgb = Rgb::new(0.45, 0.86, 0.56);
+        const ERR: Rgb = Rgb::new(1.0, 0.50, 0.46);
+        rr(cr, r.x, r.y, r.w, r.h, 14.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.05 * a);
+        cr.fill();
+
+        let (name, handle, photo) = &self.yt_account;
+        let avatar = Rect::new(r.x + 14.0, r.y + 14.0, 46.0, 46.0);
+        self.thumb_or_placeholder(cr, avatar, 23.0, photo, Icon::Music, a);
+        let tx = avatar.x + avatar.w + 14.0;
+        let name = if !name.is_empty() {
+            name.as_str()
+        } else if self.yt_google {
+            "Tu cuenta de Google"
+        } else {
+            "Tu cuenta de YouTube"
+        };
+        label(cr, name, tx, r.y + 15.0, r.w - (tx - r.x) - 120.0, 14.0, pango::Weight::Semibold, theme::TEXT, a);
+        let sub = if !handle.is_empty() {
+            handle.clone()
+        } else if self.importing {
+            "Leyendo tu cuenta…".into()
+        } else {
+            self.yt_browser.map(|b| format!("Sesión de {b}")).unwrap_or_default()
+        };
+        label(cr, &sub, tx, r.y + 37.0, r.w - (tx - r.x) - 120.0, 11.0, pango::Weight::Normal, theme::MUTED, 0.75 * a);
+        if self.accounts_ok && !self.importing && self.account_error.is_none() {
+            let badge = Rect::new(r.x + r.w - 116.0, r.y + 18.0, 102.0, 26.0);
+            rr(cr, badge.x, badge.y, badge.w, badge.h, 13.0);
+            set(cr, OK, 0.16 * a);
+            cr.fill();
+            icon(cr, Icon::Check, badge.x + 16.0, badge.cy(), 12.0, OK, a);
+            label(cr, "Conectada", badge.x + 28.0, badge.cy() - 7.5, badge.w - 30.0, 11.0, pango::Weight::Semibold, OK, a);
+        }
+
+        let y = r.y + 72.0;
+        let w = r.w - 28.0;
+        if let Some((done, total, list)) = &self.import_progress {
+            let text = if *total == 0 {
+                list.clone()
+            } else {
+                format!("Importando tus listas · {} de {} · {list}", (done + 1).min(*total), total)
+            };
+            label(cr, &text, r.x + 14.0, y, w, 11.0, pango::Weight::Medium, theme::TEXT, 0.85 * a);
+            let bar = Rect::new(r.x + 14.0, y + 20.0, w, 6.0);
+            rr(cr, bar.x, bar.y, bar.w, bar.h, 3.0);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10 * a);
+            cr.fill();
+            let (from, to) = if *total == 0 {
+                // Nothing to count yet: a segment sweeping across.
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_millis() % 1400) as f64 / 1400.0)
+                    .unwrap_or(0.0);
+                let x = t * 1.3 - 0.3;
+                (x.max(0.0), (x + 0.3).min(1.0))
+            } else {
+                (0.0, (*done as f64 / *total as f64).max(0.03))
+            };
+            rr(cr, bar.x + bar.w * from, bar.y, bar.w * (to - from), bar.h, 3.0);
+            set(cr, self.accent.lighten(0.15), a);
+            cr.fill();
+        } else if let Some(err) = &self.account_error {
+            para(cr, err, r.x + 14.0, y, w, 10.5, pango::Weight::Medium, ERR, 0.95 * a, false);
+        } else if self.accounts_ok {
+            let n = self.playlists.iter().filter(|p| !p.remote.is_empty()).count();
+            label(
+                cr,
+                &format!("Sesión iniciada · {n} listas de YouTube Music en tu Biblioteca"),
+                r.x + 14.0,
+                y + 6.0,
+                w,
+                11.0,
+                pango::Weight::Medium,
+                OK,
+                0.9 * a,
+            );
+        }
+    }
+
+    /// Accounts view: (state line, explanation) for one service.
+    fn account_text(&self, acc: Account) -> (String, String) {
+        match acc {
+            Account::YouTube if self.accounts_ok && self.yt_google => (
+                "Conectada con tu cuenta de Google".into(),
+                "Tus listas y tus «Me gusta» están en la Biblioteca.".into(),
+            ),
+            Account::YouTube if !self.accounts_ok && self.login_browser.is_some() => (
+                "Sin conectar".into(),
+                format!(
+                    "Sin cuenta igual puedes buscar y escuchar. Para traer tus listas y tus «Me gusta», \
+                     inicia sesión: se abre una ventana de {} solo para esto.",
+                    self.login_browser.unwrap_or("tu navegador")
+                ),
+            ),
+            Account::YouTube if self.accounts_ok => (
+                match self.yt_browser {
+                    Some(name) => format!("Conectada con tu sesión de {name}"),
+                    None => "Conectada".to_string(),
+                },
+                "Tus listas y tus «Me gusta» están en la Biblioteca. Elige otro navegador para cambiar de cuenta.".into(),
+            ),
+            Account::YouTube => (
+                "Sin conectar".into(),
+                "Sin cuenta igual puedes buscar y escuchar. Para traer tus listas, inicia sesión en YouTube \
+                 Music en tu navegador y elígelo aquí."
+                    .into(),
+            ),
+            Account::Spotify => {
+                let playback = if cfg!(windows) {
+                    "Sus canciones suenan desde YouTube Music."
+                } else if self.spotify.snapshot().available || self.spotify.snapshot().standby {
+                    "Reproducción con spotifyd lista."
+                } else {
+                    "Sin spotifyd, sus canciones suenan desde YouTube Music."
+                };
+                if self.spotify_search {
+                    ("Búsqueda conectada".into(), playback.into())
+                } else {
+                    (
+                        "Sin conectar".into(),
+                        "Spotify pide una app gratuita para buscar: créala (Redirect URI \
+                         http://127.0.0.1:8888/callback, marca Web API) y pega aquí sus claves."
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+
     fn pill(&self, cr: &Context, r: Rect, ic: Icon, text: &str, hovered: bool, accent: bool, a: f64) {
         rr(cr, r.x, r.y, r.w, r.h, r.h / 2.0);
         if accent {
@@ -1179,18 +1312,85 @@ impl App {
                         self.coll_row(cr, *r, &p.name, &sub, &p.art, kind, hovered, a);
                     }
                 }
+                RowItem::Connect if self.tab == Tab::Library && !self.accounts_ok => {
+                    self.pill(cr, *r, Icon::Plus, "Conectar cuentas", hovered, false, a);
+                }
+                RowItem::Connect if self.tab == Tab::Library => {
+                    let sp = if self.spotify_search { " · Spotify ✓" } else { "" };
+                    self.pill(cr, *r, Icon::Check, &format!("Cuentas · YouTube Music ✓{sp}"), hovered, false, a);
+                }
                 RowItem::Connect => {
                     self.pill(cr, *r, Icon::Spotify, "Conectar Spotify para buscar también allí", hovered, false, a);
                 }
-                RowItem::Import => {
-                    let text = if self.importing {
-                        "Importando…"
-                    } else if !self.accounts_ok {
-                        "Conectar cuentas"
+                RowItem::AccountsBack => self.pill(cr, *r, Icon::ChevronLeft, "Biblioteca", hovered, false, a),
+                RowItem::AccountInfo(Account::YouTube) if r.h > 60.0 => self.youtube_card(cr, *r, a),
+                RowItem::AccountInfo(acc) => {
+                    let (state, help) = self.account_text(acc);
+                    label(cr, &state, r.x + 4.0, r.y, r.w - 8.0, 13.0, pango::Weight::Semibold, theme::TEXT, 0.92 * a);
+                    para(cr, &help, r.x + 4.0, r.y + 21.0, r.w - 8.0, 10.5, pango::Weight::Normal, theme::MUTED, 0.7 * a, false);
+                }
+                RowItem::Browser(i) => {
+                    if let Some((name, _)) = self.browsers.get(i) {
+                        let current = self.accounts_ok && self.yt_browser == Some(*name);
+                        let text = if self.importing && !self.accounts_ok {
+                            format!("{name} · leyendo…")
+                        } else if current {
+                            format!("{name} · conectada")
+                        } else {
+                            format!("Usar mi sesión de {name}")
+                        };
+                        let ic = if current { Icon::Check } else { Icon::Music };
+                        self.pill(cr, *r, ic, &text, hovered, current, a);
+                    }
+                }
+                RowItem::GoogleLogin => {
+                    let name = self.login_browser.unwrap_or("el navegador");
+                    let text = if self.logging_in {
+                        format!("Inicia sesión en {name} y cierra esa ventana al terminar")
+                    } else if self.importing {
+                        "Importando tus listas…".to_string()
+                    } else if self.accounts_ok {
+                        "Volver a iniciar sesión".to_string()
                     } else {
-                        "Importar de YouTube Music"
+                        "Iniciar sesión con Google".to_string()
                     };
-                    self.pill(cr, *r, Icon::Queue, text, hovered, false, a);
+                    self.pill(cr, *r, Icon::Play, &text, hovered, !self.accounts_ok, a);
+                }
+                RowItem::YouTubeLogin => {
+                    self.pill(cr, *r, Icon::Play, "Iniciar sesión en YouTube Music", hovered, false, a)
+                }
+                RowItem::YouTubeDisconnect => self.pill(cr, *r, Icon::Close, "Desconectar", hovered, false, a),
+                RowItem::SpotifyApp => {
+                    self.pill(cr, *r, Icon::Spotify, "1 · Crear app en Spotify", hovered, false, a)
+                }
+                RowItem::SpotifyKeys => {
+                    let text = if self.checking_spotify {
+                        "Comprobando…"
+                    } else if self.spotify_search {
+                        "Cambiar claves"
+                    } else {
+                        "2 · Pegar Client ID y secret"
+                    };
+                    self.pill(cr, *r, Icon::Plus, text, hovered, false, a);
+                }
+                RowItem::SpotifyForget => self.pill(cr, *r, Icon::Close, "Quitar claves", hovered, false, a),
+                RowItem::SpotifyPlayback => self.pill(
+                    cr,
+                    *r,
+                    Icon::Play,
+                    "Reproducir con Premium (spotifyd · se abre una terminal)",
+                    hovered,
+                    false,
+                    a,
+                ),
+                RowItem::Import => {
+                    let text = match &self.import_progress {
+                        Some((done, total, _)) if *total > 0 => format!("Importando… {} de {total}", (done + 1).min(*total)),
+                        _ if self.importing => "Importando…".to_string(),
+                        _ if !self.accounts_ok => "Conectar cuentas".to_string(),
+                        _ => "Importar de YouTube Music".to_string(),
+                    };
+                    self.pill(cr, *r, Icon::Queue, &text, hovered, false, a);
                 }
                 RowItem::NewPlaylist => {
                     self.pill(cr, *r, Icon::Plus, "Nueva lista", hovered, false, a);

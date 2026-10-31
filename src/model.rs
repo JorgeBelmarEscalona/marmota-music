@@ -150,7 +150,15 @@ pub enum Event {
     /// (seed video id, tracks)
     RadioDone(String, Vec<Track>),
     ThumbDone(String, Option<Pixels>),
-    ImportDone(Result<usize, String>),
+    /// Lists imported and lists whose songs could not be read, or the error.
+    ImportDone(Result<(usize, usize), String>),
+    /// (lists done, lists in total, list being read); total 0 while the
+    /// account itself is being read.
+    ImportProgress(usize, usize, String),
+    /// Google sign-in finished: the saved cookies.txt, or why it failed.
+    LoginDone(Result<std::path::PathBuf, String>),
+    /// Spotify keys tried with a test search: results found, or the error.
+    SpotifyChecked(Result<usize, String>),
     /// (track id, music video id if one was found)
     VideoFound(String, Option<String>),
     /// A Spotify song replaced by its YouTube Music twin: (spotify id, twin).

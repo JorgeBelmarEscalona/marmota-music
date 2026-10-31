@@ -106,7 +106,10 @@ fn parse_entry(v: &Value) -> Option<Track> {
 }
 
 fn run_ytdlp(args: &[&str]) -> Result<Value> {
-    let out = Command::new("yt-dlp")
+    let mut cmd = Command::new("yt-dlp");
+    #[cfg(windows)]
+    crate::win::no_console(&mut cmd);
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| anyhow!("yt-dlp no está instalado: {e}"))?;
@@ -153,10 +156,10 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Track>> {
 
 /// Songs of a (possibly private) playlist, read with the browser session.
 pub fn playlist(url: &str) -> Result<Vec<Track>> {
-    let browser = crate::paths::cookies_browser();
+    let [flag, source] = crate::paths::cookie_args();
     let value = run_ytdlp(&[
-        "--cookies-from-browser",
-        &browser,
+        &flag,
+        &source,
         "--flat-playlist",
         "-J",
         "--no-warnings",
@@ -182,7 +185,9 @@ pub fn download_cover(id: &str, url: &str) -> Result<std::path::PathBuf> {
     if dest.exists() {
         return Ok(dest);
     }
-    std::fs::create_dir_all(dest.parent().unwrap_or(std::path::Path::new("/tmp")))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
         .user_agent("MarmotaMusic/0.1")
@@ -216,10 +221,10 @@ pub fn download_cover(id: &str, url: &str) -> Result<std::path::PathBuf> {
 /// The user's own playlists on YouTube / YouTube Music: (playlist id, title).
 /// "Liked music" is always included first.
 pub fn account_playlists() -> Result<Vec<(String, String)>> {
-    let browser = crate::paths::cookies_browser();
+    let [flag, source] = crate::paths::cookie_args();
     let value = run_ytdlp(&[
-        "--cookies-from-browser",
-        &browser,
+        &flag,
+        &source,
         "--flat-playlist",
         "-J",
         "--no-warnings",
@@ -239,10 +244,7 @@ pub fn account_playlists() -> Result<Vec<(String, String)>> {
         }
     }
     if out.len() == 1 {
-        return Err(anyhow!(
-            "no se encontraron listas: inicia sesión en YouTube en tu navegador \
-             (o cambia cookies_browser en ~/.config/marmota-music/config.json)"
-        ));
+        return Err(anyhow!("no se encontraron listas en tu cuenta"));
     }
     Ok(out)
 }

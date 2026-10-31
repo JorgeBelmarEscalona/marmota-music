@@ -46,6 +46,70 @@ fn call(endpoint: &str, mut body: Value) -> Result<Value> {
     Ok(resp.json()?)
 }
 
+/// The signed-in account behind a cookies.txt: (name, email or handle, photo).
+pub fn account(cookies: &std::path::Path) -> Result<(String, String, String)> {
+    let text = std::fs::read_to_string(cookies)?;
+    let jar: Vec<(&str, &str)> = text
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() == 7 && f[0].ends_with("youtube.com")).then(|| (f[5], f[6]))
+        })
+        .collect();
+    let sapisid = jar
+        .iter()
+        .find(|(n, _)| *n == "SAPISID" || *n == "__Secure-3PAPISID")
+        .map(|(_, v)| *v)
+        .ok_or_else(|| anyhow!("la sesión no tiene la cookie SAPISID"))?;
+    let cookie = jar.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
+    // Requests on behalf of the user carry a hash of the session cookie.
+    let origin = "https://music.youtube.com";
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let hash = sha1_smol::Sha1::from(format!("{ts} {sapisid} {origin}")).digest().to_string();
+
+    let body = json!({
+        "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": CLIENT_VERSION, "hl": "es", "gl": "CL" } }
+    });
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+        .build()?
+        .post(format!("{BASE}account/account_menu?prettyPrint=false"))
+        .header("Origin", origin)
+        .header("X-Origin", origin)
+        .header("Referer", "https://music.youtube.com/")
+        .header("X-Goog-AuthUser", "0")
+        .header("Authorization", format!("SAPISIDHASH {ts}_{hash}"))
+        .header("Cookie", cookie)
+        .json(&body)
+        .send()?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("YouTube Music respondió {}", resp.status()));
+    }
+    let v: Value = resp.json()?;
+    let header = find(&v, "activeAccountHeaderRenderer").ok_or_else(|| anyhow!("tu sesión ya no es válida"))?;
+    let runs = |key: &str| {
+        header
+            .get(key)
+            .and_then(|t| t.get("runs").and_then(|r| r[0]["text"].as_str()).or_else(|| t["simpleText"].as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    let name = runs("accountName");
+    let mut email = runs("email");
+    if email.is_empty() {
+        email = runs("channelHandle");
+    }
+    let photo = header["accountPhoto"]["thumbnails"]
+        .as_array()
+        .and_then(|t| t.last())
+        .and_then(|t| t["url"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((name, email, photo))
+}
+
 // ------------------------------------------------------------------ walking
 
 fn walk<'a>(v: &'a Value, keys: &[&'a str], out: &mut Vec<(&'a str, &'a Value)>) {
