@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -419,14 +419,53 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
     let mut ended_sent = false;
     let mut current_url = String::new();
     let mut resume_on_load: Option<f64> = None;
+    // YouTube sometimes refuses a stream (403, bot check, expired link) or
+    // yt-dlp hangs; mpv then just goes idle. Retry the same song instead of
+    // leaving the notch stuck at 0:00.
+    const MAX_RETRIES: u32 = 4;
+    const LOAD_TIMEOUT: Duration = Duration::from_secs(25);
+    let mut retries: u32 = 0;
+    let mut retry_at: Option<Instant> = None;
+    let mut loading_since: Option<Instant> = None;
 
     loop {
+        let now = Instant::now();
+        if loading_since.is_some_and(|t| now.duration_since(t) > LOAD_TIMEOUT) {
+            loading_since = None;
+            if retries < MAX_RETRIES {
+                retry_at = Some(now);
+            } else {
+                let _ = events.send(Event::Error(
+                    "YouTube no responde. Pulsa ▶ para intentarlo de nuevo".into(),
+                ));
+            }
+        }
+        if retry_at.is_some_and(|t| now >= t) && !current_url.is_empty() {
+            retry_at = None;
+            retries += 1;
+            if resume_on_load.is_none() {
+                let pos = shared.lock().map(|s| s.pos).unwrap_or(0.0);
+                if pos > 1.0 {
+                    resume_on_load = Some(pos);
+                }
+            }
+            if let Ok(mut s) = shared.lock() {
+                s.idle = false;
+                s.playing = true;
+            }
+            ended_sent = false;
+            loading_since = Some(now);
+            send(&mut stream, &mut rid, json!(["loadfile", current_url, "replace"]));
+        }
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 MpvCmd::Load(url) => {
                     ended_sent = false;
                     current_url = url.clone();
                     resume_on_load = None;
+                    retries = 0;
+                    retry_at = None;
+                    loading_since = Some(Instant::now());
                     if let Ok(mut s) = shared.lock() {
                         s.pos = 0.0;
                         s.idle = false;
@@ -435,6 +474,13 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                     send(&mut stream, &mut rid, json!(["loadfile", url, "replace"]));
                 }
                 MpvCmd::Pause(paused) => {
+                    let idle = shared.lock().map(|s| s.idle).unwrap_or(false);
+                    if !paused && idle && !current_url.is_empty() && loading_since.is_none() {
+                        // Nothing loaded (the stream failed): play ▶ means
+                        // "try this song again", not "unpause nothing".
+                        retries = 0;
+                        retry_at = Some(Instant::now());
+                    }
                     send(&mut stream, &mut rid, json!(["set_property", "pause", paused]));
                 }
                 MpvCmd::Seek(pos) => {
@@ -458,6 +504,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                         send(&mut stream, &mut rid, json!(["set_property", "vid", "auto"]));
                         resume_on_load = Some(pos);
                         ended_sent = false;
+                        retries = 0;
+                        retry_at = None;
+                        loading_since = Some(Instant::now());
                         send(&mut stream, &mut rid, json!(["loadfile", current_url, "replace"]));
                     } else if !on {
                         // Keep the current stream playing; just drop the picture.
@@ -469,6 +518,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                     }
                 }
                 MpvCmd::Stop => {
+                    retry_at = None;
+                    loading_since = None;
+                    current_url.clear();
                     send(&mut stream, &mut rid, json!(["stop"]));
                     if let Ok(mut s) = shared.lock() {
                         s.playing = false;
@@ -535,9 +587,28 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                                 ended_sent = true;
                                 let _ = events.send(Event::Ended);
                             }
+                            if reason == "error" && retry_at.is_none() {
+                                loading_since = None;
+                                if retries < MAX_RETRIES {
+                                    let wait = Duration::from_millis(800 * (1 << retries));
+                                    retry_at = Some(Instant::now() + wait);
+                                    let _ = events.send(Event::Error(format!(
+                                        "YouTube no entregó la canción, reintentando ({}/{MAX_RETRIES})…",
+                                        retries + 1
+                                    )));
+                                } else {
+                                    let detail = v.get("file_error").and_then(|e| e.as_str()).unwrap_or("error");
+                                    let _ = events.send(Event::Error(format!(
+                                        "No pude cargar la canción ({detail}). Pulsa ▶ para reintentar"
+                                    )));
+                                }
+                            }
                         }
                         if event == Some("file-loaded") {
                             ended_sent = false;
+                            loading_since = None;
+                            retry_at = None;
+                            retries = 0;
                             if let Ok(mut s) = shared.lock() {
                                 s.idle = false;
                                 s.playing = true;
