@@ -309,7 +309,8 @@ impl Mpv {
                 ("terminal", "no"),
                 ("input-terminal", "no"),
                 ("cache", "yes"),
-                ("cache-pause", "no"),
+                ("cache-pause", "yes"),
+                ("cache-pause-wait", "1"),
                 ("cache-pause-initial", "no"),
                 ("demuxer-max-bytes", "67108864"),
                 ("ytdl", "yes"),
@@ -407,6 +408,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
         "idle-active",
         "eof-reached",
         "video-format",
+        "core-idle",
+        "seeking",
+        "demuxer-cache-duration",
     ]
     .iter()
     .enumerate()
@@ -427,6 +431,7 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
     let mut retries: u32 = 0;
     let mut retry_at: Option<Instant> = None;
     let mut loading_since: Option<Instant> = None;
+    let (mut paused, mut core_idle, mut seeking) = (false, false, false);
 
     loop {
         let now = Instant::now();
@@ -435,9 +440,12 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
             if retries < MAX_RETRIES {
                 retry_at = Some(now);
             } else {
-                let _ = events.send(Event::Error(
-                    "YouTube no responde. Pulsa ▶ para intentarlo de nuevo".into(),
-                ));
+                if let Ok(mut s) = shared.lock() {
+                    s.loading = false;
+                    s.failed = true;
+                }
+                // Drop the hung load so ▶ finds mpv idle and starts over.
+                send(&mut stream, &mut rid, json!(["stop"]));
             }
         }
         if retry_at.is_some_and(|t| now >= t) && !current_url.is_empty() {
@@ -452,6 +460,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
             if let Ok(mut s) = shared.lock() {
                 s.idle = false;
                 s.playing = true;
+                s.loading = true;
+                s.failed = false;
+                s.retry = retries;
             }
             ended_sent = false;
             loading_since = Some(now);
@@ -468,8 +479,14 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                     loading_since = Some(Instant::now());
                     if let Ok(mut s) = shared.lock() {
                         s.pos = 0.0;
+                        s.dur = 0.0;
                         s.idle = false;
                         s.playing = true;
+                        s.loading = true;
+                        s.buffering = false;
+                        s.failed = false;
+                        s.retry = 0;
+                        s.cache_ahead = 0.0;
                     }
                     send(&mut stream, &mut rid, json!(["loadfile", url, "replace"]));
                 }
@@ -507,6 +524,11 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                         retries = 0;
                         retry_at = None;
                         loading_since = Some(Instant::now());
+                        if let Ok(mut s) = shared.lock() {
+                            s.loading = true;
+                            s.failed = false;
+                            s.retry = 0;
+                        }
                         send(&mut stream, &mut rid, json!(["loadfile", current_url, "replace"]));
                     } else if !on {
                         // Keep the current stream playing; just drop the picture.
@@ -526,6 +548,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                         s.playing = false;
                         s.idle = true;
                         s.pos = 0.0;
+                        s.loading = false;
+                        s.buffering = false;
+                        s.failed = false;
                     }
                 }
             }
@@ -555,8 +580,13 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                                         }
                                     }
                                     "pause" => {
-                                        let paused = data.as_bool().unwrap_or(false);
-                                        s.playing = !paused && !s.idle;
+                                        paused = data.as_bool().unwrap_or(false);
+                                        s.playing = !paused && (!s.idle || s.loading);
+                                    }
+                                    "core-idle" => core_idle = data.as_bool().unwrap_or(false),
+                                    "seeking" => seeking = data.as_bool().unwrap_or(false),
+                                    "demuxer-cache-duration" => {
+                                        s.cache_ahead = data.as_f64().unwrap_or(0.0);
                                     }
                                     "volume" => {
                                         if let Some(vol) = data.as_f64() {
@@ -564,8 +594,12 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                                         }
                                     }
                                     "idle-active" => {
+                                        // mpv leaves idle when a load starts: that is
+                                        // no reason to flip the button back to ▶.
                                         s.idle = data.as_bool().unwrap_or(false);
-                                        s.playing = false;
+                                        if s.idle {
+                                            s.playing = false;
+                                        }
                                     }
                                     "video-format" => {
                                         s.has_video = !data.is_null();
@@ -578,6 +612,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                                     }
                                     _ => {}
                                 }
+                                s.buffering = !s.loading
+                                    && !s.idle
+                                    && (seeking || (core_idle && !paused));
                             }
                         }
                         let event = v.get("event").and_then(|e| e.as_str());
@@ -592,16 +629,20 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                                 if retries < MAX_RETRIES {
                                     let wait = Duration::from_millis(800 * (1 << retries));
                                     retry_at = Some(Instant::now() + wait);
-                                    let _ = events.send(Event::Error(format!(
-                                        "YouTube no entregó la canción, reintentando ({}/{MAX_RETRIES})…",
-                                        retries + 1
-                                    )));
-                                } else {
-                                    let detail = v.get("file_error").and_then(|e| e.as_str()).unwrap_or("error");
-                                    let _ = events.send(Event::Error(format!(
-                                        "No pude cargar la canción ({detail}). Pulsa ▶ para reintentar"
-                                    )));
+                                    if let Ok(mut s) = shared.lock() {
+                                        s.loading = true;
+                                        s.retry = retries + 1;
+                                    }
+                                } else if let Ok(mut s) = shared.lock() {
+                                    s.loading = false;
+                                    s.failed = true;
                                 }
+                            }
+                        }
+                        if event == Some("playback-restart") {
+                            if let Ok(mut s) = shared.lock() {
+                                s.loading = false;
+                                s.retry = 0;
                             }
                         }
                         if event == Some("file-loaded") {
@@ -611,7 +652,7 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                             retries = 0;
                             if let Ok(mut s) = shared.lock() {
                                 s.idle = false;
-                                s.playing = true;
+                                s.playing = !paused;
                             }
                             if let Some(pos) = resume_on_load.take() {
                                 if pos > 1.0 {
