@@ -88,6 +88,16 @@ pub struct Playback {
     pub volume: f64,
     pub idle: bool,
     pub has_video: bool,
+    /// A song was asked for and its first audio has not started yet.
+    pub loading: bool,
+    /// Mid-song wait: seeking, or the network fell behind.
+    pub buffering: bool,
+    /// Every attempt to load the song failed.
+    pub failed: bool,
+    /// Which retry the current load is (0 = first attempt).
+    pub retry: u32,
+    /// Seconds of the song already downloaded, ahead of the playhead.
+    pub cache_ahead: f64,
 }
 
 impl Default for Playback {
@@ -99,6 +109,11 @@ impl Default for Playback {
             volume: 70.0,
             idle: true,
             has_video: false,
+            loading: false,
+            buffering: false,
+            failed: false,
+            retry: 0,
+            cache_ahead: 0.0,
         }
     }
 }

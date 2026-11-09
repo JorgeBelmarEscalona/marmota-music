@@ -1,5 +1,5 @@
 use gtk4 as gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -23,7 +23,8 @@ pub const COLLAPSED_W: f64 = 664.0;
 pub const COLLAPSED_H: f64 = 74.0;
 pub const EXPANDED_W: f64 = 1040.0;
 pub const EXPANDED_H: f64 = 612.0;
-const ANIM_MS: f64 = 320.0;
+const ANIM_OPEN_MS: f64 = 420.0;
+const ANIM_CLOSE_MS: f64 = 320.0;
 
 pub const TRACK_ROW: f64 = 50.0;
 pub const COLL_ROW: f64 = 56.0;
@@ -377,6 +378,77 @@ pub struct App {
     pub input_rect: (i32, i32, i32, i32),
     pub dirty: bool,
     pub last_pos: f64,
+
+    // --- what the player is doing, as shown to the user
+    pub loading: bool,
+    pub buffering: bool,
+    pub failed: bool,
+    pub retry: u32,
+    pub cache_ahead: f64,
+    pub load_t0: Instant,
+    pub buffer_t0: Option<Instant>,
+    /// Looking for a Spotify song's twin on YouTube Music.
+    pub resolving: bool,
+    pub activity: String,
+    pub activity_prev: String,
+    pub activity_err: bool,
+    /// Line shown instead of the artist: 0 hidden, 1 shown.
+    pub activity_on: f64,
+    /// Crossfade from the previous activity text to the current one.
+    pub activity_swap: f64,
+
+    // --- animation: every value below eases towards its target in tick()
+    pub t0: Instant,
+    pub last_tick: Instant,
+    pub last_spin: Instant,
+    /// Something is easing: repaint on every displayed frame.
+    pub moving: bool,
+    /// An indeterminate indicator is on screen: repaint at a steady rate.
+    pub busy: bool,
+    pub anim_ms: f64,
+    pub presence: f64,
+    pub loading_mix: f64,
+    pub play_mix: f64,
+    pub shown_pos: f64,
+    pub hover_row: Option<Hit>,
+    pub hover_fade: Vec<(Hit, f64)>,
+    pub press: Option<(Hit, f64)>,
+    /// Hover strength of the row being painted (see draw_rows).
+    pub row_fade: Cell<f64>,
+    pub shown_title: String,
+    pub shown_artist: String,
+    pub prev_title: String,
+    pub prev_artist: String,
+    pub track_mix: f64,
+    pub prev_cover: Option<cairo::ImageSurface>,
+    pub prev_blur: Option<cairo::ImageSurface>,
+    pub cover_mix: f64,
+    pub cover_gen: u64,
+    pub accent_to: Rgb,
+    pub lyric_shift: f64,
+    pub lyric_prev_idx: usize,
+    pub lyric_wheel: Option<f64>,
+    pub tab_x: f64,
+    pub tab_w: f64,
+    pub tab_mix: [f64; 4],
+    pub content_mix: f64,
+    pub content_sig: (Tab, bool, bool, bool, bool),
+    pub scroll_to: Option<f64>,
+    pub list_busy: bool,
+    /// Backdrop painted once and reused while nothing about it changes.
+    pub glass_cache: RefCell<Option<((u64, u64, u64, u64, u64), cairo::ImageSurface)>>,
+}
+
+/// Ease `x` towards `to` with time constant `tau` (seconds), whatever the
+/// frame rate, and snap once closer than `eps`. Returns true while moving.
+fn ease(x: &mut f64, to: f64, dt: f64, tau: f64, eps: f64) -> bool {
+    if (*x - to).abs() < eps {
+        let changed = *x != to;
+        *x = to;
+        return changed;
+    }
+    *x += (to - *x) * (1.0 - (-dt / tau).exp());
+    true
 }
 
 pub fn run(
@@ -693,6 +765,54 @@ fn build(
         yt_playing: false,
         status: String::new(),
         status_at: Instant::now(),
+        loading: false,
+        buffering: false,
+        failed: false,
+        retry: 0,
+        cache_ahead: 0.0,
+        load_t0: Instant::now(),
+        buffer_t0: None,
+        resolving: false,
+        activity: String::new(),
+        activity_prev: String::new(),
+        activity_err: false,
+        activity_on: 0.0,
+        activity_swap: 1.0,
+        t0: Instant::now(),
+        last_tick: Instant::now(),
+        last_spin: Instant::now(),
+        moving: false,
+        busy: false,
+        anim_ms: ANIM_OPEN_MS,
+        presence: 0.0,
+        loading_mix: 0.0,
+        play_mix: 0.0,
+        shown_pos: 0.0,
+        hover_row: None,
+        hover_fade: Vec::new(),
+        press: None,
+        row_fade: Cell::new(0.0),
+        shown_title: String::new(),
+        shown_artist: String::new(),
+        prev_title: String::new(),
+        prev_artist: String::new(),
+        track_mix: 1.0,
+        prev_cover: None,
+        prev_blur: None,
+        cover_mix: 1.0,
+        cover_gen: 0,
+        accent_to: theme::ACCENT_FALLBACK,
+        lyric_shift: 0.0,
+        lyric_prev_idx: 0,
+        lyric_wheel: None,
+        tab_x: 0.0,
+        tab_w: 0.0,
+        tab_mix: [1.0, 0.0, 0.0, 0.0],
+        content_mix: 1.0,
+        content_sig: (Tab::Lyrics, false, false, false, false),
+        scroll_to: None,
+        list_busy: false,
+        glass_cache: RefCell::new(None),
         entry_mode: EntryMode::Hidden,
         width: COLLAPSED_W,
         height: COLLAPSED_H,
@@ -765,7 +885,9 @@ fn build(
                 s.set_volume(target);
             } else if l.content.contains(s.mouse.0, s.mouse.1) {
                 if s.tab == Tab::Lyrics {
-                    s.lyric_scroll += dy * 40.0;
+                    let max = (s.lyrics.len() as f64 * 46.0).max(0.0);
+                    let from = s.lyric_wheel.unwrap_or(s.lyric_scroll);
+                    s.lyric_wheel = Some((from + dy * 40.0).clamp(-l.lyrics.h / 2.0, max));
                     s.lyric_manual = Instant::now();
                     // Resume auto-follow with a fresh tween afterwards.
                     s.lyric_to = f64::MIN;
@@ -904,7 +1026,7 @@ fn build(
         let fa = app_cell.clone();
         area.add_tick_callback(move |_, _| {
             if let Ok(mut s) = fa.try_borrow_mut() {
-                if s.animating {
+                if s.animating || s.moving {
                     s.tick();
                 }
             }
@@ -912,7 +1034,7 @@ fn build(
         });
         glib::timeout_add_local(Duration::from_millis(16), move || {
             if let Ok(mut s) = a.try_borrow_mut() {
-                if s.animating && s.area.is_mapped() {
+                if (s.animating || s.moving) && s.area.is_mapped() {
                     return glib::ControlFlow::Continue;
                 }
                 let t0 = Instant::now();
@@ -1335,20 +1457,12 @@ impl App {
         let (ox, oy) = self.origin();
         let (x, y) = (x / k - ox, y / k - oy);
         self.mouse = (x, y);
+        self.update_hover();
+        if self.hover == Some(Hit::Seek) {
+            self.dirty = true; // the time under the pointer follows it
+        }
+        let hit = self.hover;
         let l = self.layout();
-        let mut hit = l.hit(x, y);
-        if hit.is_none() && !l.collapsed && l.content.contains(x, y) {
-            for (r, item) in self.rows(l.content) {
-                if r.contains(x, y) {
-                    hit = item.hit();
-                    break;
-                }
-            }
-        }
-        if hit != self.hover {
-            self.hover = hit;
-            self.dirty = true;
-        }
         let pointer = hit.is_some();
         if pointer != self.cursor.is_some() {
             self.cursor = hit;
@@ -1369,6 +1483,30 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// What is under the pointer, from its last known position.
+    fn update_hover(&mut self) {
+        let (x, y) = self.mouse;
+        let l = self.layout();
+        let mut hit = l.hit(x, y);
+        let mut row = None;
+        if !l.collapsed && l.content.contains(x, y) {
+            // Action buttons come before their row, so the first match is
+            // what gets clicked and the last one is the row behind it.
+            let mut over = self.rows(l.content).into_iter().filter(|(r, _)| r.contains(x, y));
+            if let Some((_, first)) = over.next() {
+                if hit.is_none() {
+                    hit = first.hit();
+                }
+                row = over.last().map_or(first, |(_, last)| last).hit();
+            }
+        }
+        self.hover_row = row;
+        if hit != self.hover {
+            self.hover = hit;
+            self.dirty = true;
         }
     }
 
@@ -1454,6 +1592,7 @@ impl App {
     }
 
     fn act(&mut self, hit: Hit, x: f64, _y: f64) {
+        self.press = Some((hit, 1.0));
         match hit {
             Hit::Prev => self.prev(),
             Hit::Play => self.toggle_play(),
@@ -2088,7 +2227,7 @@ impl App {
                 return;
             }
             // No Spotify device running: play the same song from YouTube Music.
-            self.set_status("Spotify no está conectado: busco la canción en YouTube Music…");
+            self.resolving = true;
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let twin = youtube_twin(&t);
@@ -2159,6 +2298,9 @@ impl App {
         self.lyrics_synced = false;
         self.lyrics_state = 1;
         self.lyric_idx = 0;
+        self.lyric_prev_idx = 0;
+        self.lyric_shift = 0.0;
+        self.lyric_wheel = None;
         self.lyric_scroll = 0.0;
         self.lyric_offset = 0.0;
         self.lyric_dur = 0.0;
@@ -2200,8 +2342,13 @@ impl App {
 
     fn start_cover(&mut self, t: &Track) {
         self.cover_key = t.id.clone();
-        self.cover = None;
-        self.cover_blur = None;
+        // The old cover stays up until the new one is here, then crossfades.
+        if let Some(old) = self.cover.take() {
+            self.prev_cover = Some(old);
+            self.prev_blur = self.cover_blur.take();
+        }
+        self.cover_mix = 0.0;
+        self.cover_gen += 1;
         let tx = self.tx.clone();
         let id = t.id.clone();
         let art = t.art.clone();
@@ -2210,9 +2357,8 @@ impl App {
         std::thread::spawn(move || {
             let path = paths::art_path(&id);
             let path = if path.exists() { Ok(path) } else { yt::download_cover(&id, &art) };
-            if let Ok(path) = path {
-                let _ = tx.send(Event::CoverDone(id, decode_pixels(&path, 640)));
-            }
+            let px = path.ok().and_then(|path| decode_pixels(&path, 640));
+            let _ = tx.send(Event::CoverDone(id, px));
         });
     }
 
@@ -2220,8 +2366,17 @@ impl App {
         if self.track.as_ref().map(|t| t.id.as_str()) != Some(id) {
             return;
         }
-        if let Some(mut surface) = px.as_ref().and_then(to_surface) {
-            self.accent = theme::accent_from_surface(&mut surface);
+        let Some(mut surface) = px.as_ref().and_then(to_surface) else {
+            // No cover for this song: don't leave the previous song's up.
+            self.prev_cover = None;
+            self.prev_blur = None;
+            self.cover_mix = 1.0;
+            self.cover_gen += 1;
+            self.dirty = true;
+            return;
+        };
+        {
+            self.accent_to = theme::accent_from_surface(&mut surface);
             // The glass backdrop only needs a 12 px version; make it once
             // instead of shrinking the full cover every frame.
             self.cover_blur = cairo::ImageSurface::create(cairo::Format::ARgb32, 12, 12)
@@ -2235,6 +2390,8 @@ impl App {
                     Some(small)
                 });
             self.cover = Some(surface);
+            self.cover_mix = 0.0;
+            self.cover_gen += 1;
             self.dirty = true;
         }
     }
@@ -2665,7 +2822,8 @@ impl App {
 
     fn scroll_list(&mut self, dy: f64) {
         let max = self.list_extent();
-        self.list_scroll = (self.list_scroll + dy * 52.0).clamp(0.0, max);
+        let from = self.scroll_to.unwrap_or(self.list_scroll);
+        self.scroll_to = Some((from + dy * 52.0).clamp(0.0, max));
         self.dirty = true;
     }
 
@@ -2839,6 +2997,7 @@ impl App {
                 }
             }
             Event::Substitute(sp_id, twin) => {
+                self.resolving = false;
                 let current = self.queue.get(self.index).is_some_and(|t| t.id == sp_id);
                 match twin {
                     Some(yt) if current => {
@@ -2962,6 +3121,7 @@ impl App {
         }
         self.anim_from = self.anim;
         self.anim_to = to;
+        self.anim_ms = if to > self.anim { ANIM_OPEN_MS } else { ANIM_CLOSE_MS };
         self.anim_t0 = Instant::now();
         self.animating = true;
         self.dirty = true;
@@ -3072,6 +3232,9 @@ impl App {
                 self.switch_source(Source::Spotify);
             }
         }
+        if !self.visible {
+            self.presence = 0.0;
+        }
         self.visible = true;
         self.hiding = false;
         self.place();
@@ -3120,13 +3283,9 @@ impl App {
         if self.entry_mode.transient() {
             self.close_entry();
         }
-        if self.anim <= 0.01 {
-            self.window.set_visible(false);
-            self.visible = false;
-            self.hiding = false;
-        } else {
-            self.start_anim(0.0);
-        }
+        // tick() fades the pill out once it has finished collapsing.
+        self.start_anim(0.0);
+        self.dirty = true;
     }
 
     fn set_status(&mut self, msg: &str) {
@@ -3189,7 +3348,205 @@ impl App {
         self.dirty = true;
     }
 
+    /// Hover strength of a control, 0..1.
+    pub fn hv(&self, hit: Hit) -> f64 {
+        self.hover_fade.iter().find(|(h, _)| *h == hit).map_or(0.0, |(_, v)| *v)
+    }
+
+    /// How freshly a control was pressed, 0..1.
+    pub fn pressed(&self, hit: Hit) -> f64 {
+        self.press.filter(|(h, _)| *h == hit).map_or(0.0, |(_, v)| v)
+    }
+
+    /// Seconds since start, for looping indicators.
+    pub fn clock(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64()
+    }
+
+    /// Text for the line under the title, and whether it reports a failure.
+    fn activity_now(&self) -> (String, bool) {
+        if self.failed {
+            return ("No se pudo cargar · ▶ reintenta".into(), true);
+        }
+        if self.resolving {
+            return ("Buscando en YouTube Music…".into(), false);
+        }
+        if self.loading {
+            let text = if self.retry > 0 {
+                format!("Reintentando… ({}/4)", self.retry)
+            } else if self.source == Source::Spotify {
+                "Conectando con Spotify…".into()
+            } else if self.load_t0.elapsed().as_secs() >= 8 {
+                "YouTube está tardando, sigo intentando…".into()
+            } else {
+                "Cargando canción…".into()
+            };
+            return (text, false);
+        }
+        // A short wait (most seeks) shouldn't flash a message.
+        if self.buffer_t0.is_some_and(|t| t.elapsed().as_millis() > 350) {
+            return ("Esperando más audio…".into(), false);
+        }
+        if !self.status.is_empty() && self.status_at.elapsed().as_secs() < 4 {
+            return (self.status.clone(), false);
+        }
+        (String::new(), false)
+    }
+
+    /// Advance everything that eases. Called once per tick.
+    fn animate(&mut self, dt: f64) {
+        let mut m = false;
+
+        // Hover and press.
+        let hover = self.hover;
+        let row = self.hover_row;
+        for h in [hover, row].into_iter().flatten() {
+            if !self.hover_fade.iter().any(|(f, _)| *f == h) {
+                self.hover_fade.push((h, 0.0));
+            }
+        }
+        for (h, v) in self.hover_fade.iter_mut() {
+            let on = Some(*h) == hover || Some(*h) == row;
+            m |= ease(v, if on { 1.0 } else { 0.0 }, dt, if on { 0.035 } else { 0.09 }, 0.01);
+        }
+        self.hover_fade.retain(|(h, v)| *v > 0.0 || Some(*h) == hover || Some(*h) == row);
+        if let Some((_, v)) = self.press.as_mut() {
+            m |= ease(v, 0.0, dt, 0.08, 0.01);
+            if *v <= 0.0 {
+                self.press = None;
+            }
+        }
+
+        // Player state.
+        let waiting = self.loading || self.resolving;
+        m |= ease(&mut self.loading_mix, if waiting { 1.0 } else { 0.0 }, dt, 0.09, 0.01);
+        let want_pause = self.playing || (waiting && !self.failed);
+        m |= ease(&mut self.play_mix, if want_pause { 1.0 } else { 0.0 }, dt, 0.045, 0.01);
+
+        // A seek or a new song glides there; normal playback follows exactly.
+        if self.dragging == Some(Drag::Seek) || (self.pos - self.shown_pos).abs() < 0.75 {
+            self.shown_pos = self.pos;
+        } else {
+            m |= ease(&mut self.shown_pos, self.pos, dt, 0.07, 0.02);
+        }
+
+        // Song change: title, artist and colour.
+        let (title, artist) = match &self.track {
+            Some(t) => (t.title.clone(), t.subtitle()),
+            None => ("Nada sonando".to_string(), crate::setup::shortcut()),
+        };
+        if title != self.shown_title || artist != self.shown_artist {
+            self.prev_title = std::mem::replace(&mut self.shown_title, title);
+            self.prev_artist = std::mem::replace(&mut self.shown_artist, artist);
+            self.track_mix = if self.prev_title.is_empty() { 1.0 } else { 0.0 };
+        }
+        m |= ease(&mut self.track_mix, 1.0, dt, 0.07, 0.01);
+        if self.cover.is_some() {
+            m |= ease(&mut self.cover_mix, 1.0, dt, 0.10, 0.01);
+            if self.cover_mix >= 1.0 && self.prev_cover.is_some() {
+                self.prev_cover = None;
+                self.prev_blur = None;
+                m = true;
+            }
+        }
+        let to = self.accent_to;
+        let (mut r, mut g, mut b) = (self.accent.0, self.accent.1, self.accent.2);
+        m |= ease(&mut r, to.0, dt, 0.16, 0.003);
+        m |= ease(&mut g, to.1, dt, 0.16, 0.003);
+        m |= ease(&mut b, to.2, dt, 0.16, 0.003);
+        self.accent = Rgb::new(r, g, b);
+
+        // Line under the title.
+        let (text, err) = self.activity_now();
+        if !text.is_empty() && text != self.activity {
+            self.activity_prev = if self.activity_on > 0.4 {
+                std::mem::take(&mut self.activity)
+            } else {
+                String::new()
+            };
+            self.activity = text.clone();
+            self.activity_swap = 0.0;
+        }
+        if !text.is_empty() {
+            self.activity_err = err;
+        }
+        m |= ease(&mut self.activity_on, if text.is_empty() { 0.0 } else { 1.0 }, dt, 0.07, 0.01);
+        m |= ease(&mut self.activity_swap, 1.0, dt, 0.07, 0.01);
+
+        // Lyric line change.
+        m |= ease(&mut self.lyric_shift, 0.0, dt, 0.09, 0.005);
+
+        // Tabs, and the content they show.
+        let tabs = self.expanded_layout().tabs;
+        let order = [Tab::Lyrics, Tab::Library, Tab::Search, Tab::Queue];
+        let active = order.iter().position(|t| *t == self.tab).unwrap_or(0);
+        if self.tab_w <= 0.0 {
+            self.tab_x = tabs[active].x;
+            self.tab_w = tabs[active].w;
+        }
+        m |= ease(&mut self.tab_x, tabs[active].x, dt, 0.06, 0.1);
+        m |= ease(&mut self.tab_w, tabs[active].w, dt, 0.06, 0.1);
+        for (i, v) in self.tab_mix.iter_mut().enumerate() {
+            m |= ease(v, if i == active { 1.0 } else { 0.0 }, dt, 0.06, 0.01);
+        }
+        let sig = (
+            self.tab,
+            self.detail_here(),
+            self.results.is_empty(),
+            self.lyrics.is_empty(),
+            self.accounts,
+        );
+        if sig != self.content_sig {
+            self.content_sig = sig;
+            self.content_mix = 0.0;
+            self.scroll_to = None;
+        }
+        m |= ease(&mut self.content_mix, 1.0, dt, 0.06, 0.01);
+
+        // Wheel scrolling.
+        if let Some(to) = self.scroll_to {
+            let moving = ease(&mut self.list_scroll, to, dt, 0.055, 0.25);
+            m |= moving;
+            if !moving {
+                self.scroll_to = None;
+            }
+            self.update_hover();
+        }
+        if self.lyric_manual.elapsed().as_secs() > 4 {
+            self.lyric_wheel = None;
+        }
+        if let Some(to) = self.lyric_wheel {
+            m |= ease(&mut self.lyric_scroll, to, dt, 0.055, 0.25);
+        }
+
+        // The auto-follow tween of the synced lyrics (run earlier in tick).
+        m |= self.anim > 0.5
+            && self.lyric_wheel.is_none()
+            && self.lyric_to != f64::MIN
+            && (self.lyric_scroll - self.lyric_to).abs() > 0.01;
+
+        // Pill appearing and leaving the screen.
+        let leaving = self.hiding && !self.animating;
+        m |= ease(&mut self.presence, if leaving { 0.0 } else { 1.0 }, dt, 0.05, 0.01);
+        if leaving && self.presence <= 0.0 {
+            self.window.set_visible(false);
+            self.visible = false;
+            self.hiding = false;
+        }
+
+        self.list_busy = self.searching
+            || (self.tab == Tab::Search && self.home_state == 1)
+            || self.detail.as_ref().is_some_and(|d| d.loading && d.tab == self.tab);
+        let lyric_wait = self.lyrics_state == 1 && self.tab == Tab::Lyrics && self.expanded;
+        self.busy = self.visible
+            && (waiting || self.loading_mix > 0.0 || self.list_busy || lyric_wait);
+        self.moving = m && self.visible;
+    }
+
     fn tick(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.05);
+        self.last_tick = now;
         while let Ok(ev) = self.rx.try_recv() {
             self.handle_event(ev);
         }
@@ -3200,6 +3557,16 @@ impl App {
 
         let (mut pos, mut dur, mut playing, has_video) = {
             let p = self.playback.lock().unwrap();
+            let was_loading = self.loading;
+            self.loading = p.loading;
+            if p.loading && !was_loading {
+                self.load_t0 = Instant::now();
+            }
+            self.buffering = p.buffering;
+            self.buffer_t0 = if p.buffering { self.buffer_t0.or(Some(Instant::now())) } else { None };
+            self.failed = p.failed;
+            self.retry = p.retry;
+            self.cache_ahead = p.cache_ahead;
             (p.pos, p.dur, p.playing, p.has_video)
         };
         if self.source == Source::Spotify {
@@ -3222,7 +3589,7 @@ impl App {
                         self.spotify.send(SpotifyCmd::Pause);
                         self.spotify_queue = false;
                         self.source = Source::YouTube;
-                        self.set_status("Spotify no pudo reproducirla; suena desde YouTube Music");
+                        self.resolving = true;
                         let tx = self.tx.clone();
                         std::thread::spawn(move || {
                             let twin = youtube_twin(&t);
@@ -3247,6 +3614,22 @@ impl App {
                 pos = sp.pos;
                 dur = sp.dur;
                 playing = sp.playing;
+                // Spotify has no load event: "loading" is until our song runs.
+                if self.spotify_queue
+                    && sp.playing
+                    && sp.pos > 0.3
+                    && spotify_key(&sp.track_id) == self.spotify_seen
+                {
+                    self.sp_confirmed = true;
+                }
+                self.loading = self.spotify_queue
+                    && !self.sp_confirmed
+                    && self.sp_started.elapsed() < Duration::from_secs(10);
+                self.buffering = false;
+                self.buffer_t0 = None;
+                self.failed = false;
+                self.retry = 0;
+                self.cache_ahead = 0.0;
                 self.sync_spotify(&sp);
                 if self.dragging != Some(Drag::Volume) && sp.volume > 0.0 {
                     self.volume = (sp.volume * 100.0).clamp(0.0, 100.0);
@@ -3269,7 +3652,7 @@ impl App {
             // Repaint only when the progress bar visibly moves (~1 px), not on
             // every 16 ms tick while a song plays.
             let step = if self.dur > 0.0 {
-                (self.dur / 300.0).max(0.10)
+                (self.dur / 1200.0).clamp(0.05, 0.5)
             } else {
                 0.50
             };
@@ -3318,17 +3701,13 @@ impl App {
         }
 
         if self.animating {
-            let t = (self.anim_t0.elapsed().as_secs_f64() * 1000.0 / ANIM_MS).min(1.0);
-            let e = 1.0 - (1.0 - t).powi(3);
+            let t = (self.anim_t0.elapsed().as_secs_f64() * 1000.0 / self.anim_ms).min(1.0);
+            let e = 1.0 - (1.0 - t).powi(4);
             self.anim = self.anim_from + (self.anim_to - self.anim_from) * e;
             if t >= 1.0 {
                 self.anim = self.anim_to;
                 self.animating = false;
-                if self.hiding {
-                    self.window.set_visible(false);
-                    self.visible = false;
-                    self.hiding = false;
-                }
+                self.update_hover();
             }
             self.dirty = true;
         }
@@ -3356,7 +3735,9 @@ impl App {
                 .rposition(|l| l.t + self.lyric_offset <= self.pos + 0.12)
                 .unwrap_or(0);
             if idx != self.lyric_idx {
+                self.lyric_prev_idx = self.lyric_idx;
                 self.lyric_idx = idx;
+                self.lyric_shift = 1.0;
                 self.dirty = true;
             }
             let lr = self.layout().lyrics;
@@ -3380,27 +3761,33 @@ impl App {
         } else if self.lyrics_state == 2 && !self.lyrics_synced {
             let n = self.lyrics.len().max(1) as f64;
             if self.dur > 0.0 {
-                self.lyric_idx =
-                    ((self.pos / self.dur) * n).floor().clamp(0.0, n - 1.0) as usize;
+                let idx = ((self.pos / self.dur) * n).floor().clamp(0.0, n - 1.0) as usize;
+                if idx != self.lyric_idx {
+                    self.lyric_prev_idx = self.lyric_idx;
+                    self.lyric_idx = idx;
+                    self.lyric_shift = 1.0;
+                }
             }
         }
 
         self.sync_entry();
         self.publish();
+        self.animate(dt);
 
         self.frame = self.frame.wrapping_add(1);
+        // Spinners run at ~30 fps: a repaint uploads the whole surface, and a
+        // slow load shouldn't cost half a core. Real motion gets every frame.
+        let spin_due = self.busy && self.last_spin.elapsed() >= Duration::from_millis(32);
         if self.visible
-            && (self.animating || self.dirty || self.searching || self.dragging.is_some())
+            && (self.animating
+                || self.moving
+                || spin_due
+                || self.dirty
+                || self.dragging.is_some())
         {
-            // Smooth lyric scrolling runs at half the tick rate (30 fps);
-            // expand/collapse and drags keep every frame.
-            let smooth = !self.animating && self.dragging.is_none() && !self.searching;
-            if !smooth || self.frame % 2 == 0 {
-                self.area.queue_draw();
-                if !self.animating {
-                    self.dirty = false;
-                }
-            }
+            self.area.queue_draw();
+            self.dirty = false;
+            self.last_spin = Instant::now();
         }
     }
 }
