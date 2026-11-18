@@ -17,7 +17,26 @@ pub fn art_path(id: &str) -> PathBuf {
 }
 
 pub fn runtime_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = darwin_user_temp_dir() {
+        return dir;
+    }
     dirs::runtime_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// The per-user temporary folder (/var/folders/…/T/). A Terminal has it in
+/// $TMPDIR but a LaunchAgent may not, and the CLI and the daemon must agree
+/// on where the control socket is.
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 1024];
+    let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    buf.truncate(n - 1);
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf))).filter(|p| p.is_dir())
 }
 
 /// Control socket of the daemon. Windows has no Unix sockets in std, so there

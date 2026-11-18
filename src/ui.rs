@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::db::Db;
@@ -623,9 +623,9 @@ fn build(
     window.add_css_class("mm-window");
     window.set_default_size(COLLAPSED_W as i32, COLLAPSED_H as i32);
 
-    // On Windows the notch is a plain undecorated window that win::place
-    // pins above the taskbar.
-    #[cfg(unix)]
+    // On Windows and macOS the notch is a plain undecorated window that
+    // win::place / mac::place pin above the taskbar or the Dock.
+    #[cfg(target_os = "linux")]
     {
         window.init_layer_shell();
         window.set_namespace(Some("marmota-music"));
@@ -636,6 +636,10 @@ fn build(
         window.set_keyboard_mode(KeyboardMode::OnDemand);
     }
     window.set_visible(false);
+    // No Dock icon; global shortcut through Carbon (Hyprland binds it on
+    // Linux, win::hotkey on Windows).
+    #[cfg(target_os = "macos")]
+    crate::mac::init_app(tx.clone());
 
     let area = gtk::DrawingArea::new();
     area.set_hexpand(true);
@@ -1118,6 +1122,8 @@ impl App {
             surface.set_input_region(Some(&region));
             #[cfg(windows)]
             crate::win::set_region(&self.window, rect);
+            #[cfg(target_os = "macos")]
+            crate::mac::set_region(&self.window, rect);
             self.input_rect = rect;
         }
     }
@@ -1311,7 +1317,7 @@ impl App {
                 } else {
                     button(&mut out, &mut y, &[RowItem::SpotifyApp, RowItem::SpotifyKeys]);
                 }
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 button(&mut out, &mut y, &[RowItem::SpotifyPlayback]);
                 let _ = y;
             }
@@ -1810,9 +1816,13 @@ impl App {
                     self.logging_in = true;
                     self.account_error = None;
                     let name = self.login_browser.unwrap_or("el navegador");
-                    self.set_status(&format!(
-                        "Inicia sesión en la ventana de {name} y ciérrala cuando veas YouTube Music"
-                    ));
+                    // On macOS closing the last window leaves the browser
+                    // running, and the sign-in waits for it to exit.
+                    self.set_status(&if cfg!(target_os = "macos") {
+                        format!("Inicia sesión en {name} y ciérralo con ⌘Q cuando veas YouTube Music")
+                    } else {
+                        format!("Inicia sesión en la ventana de {name} y ciérrala cuando veas YouTube Music")
+                    });
                     crate::login::start(self.tx.clone());
                     // The notch stays on top: shrink it out of the sign-in form's way.
                     self.collapse();
@@ -2769,8 +2779,22 @@ impl App {
         }
     }
 
+    /// Run `marmota-music setup` in a Terminal.app window.
+    #[cfg(target_os = "macos")]
+    fn open_setup(&mut self) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
+        let cmd = format!("MM_SETUP_WAIT=1 {} setup", crate::mac::sh_quote(&exe.display().to_string()));
+        match crate::mac::open_terminal(&cmd) {
+            Ok(()) => {
+                self.set_status("Sigue los pasos en la Terminal");
+                self.collapse();
+            }
+            Err(e) => self.set_status(&format!("No pude abrir la Terminal: {e}")),
+        }
+    }
+
     /// Run `marmota-music setup` in a floating terminal.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn open_setup(&mut self) {
         let omarchy = "omarchy-launch-floating-terminal-with-presentation";
         let has_omarchy = std::process::Command::new("sh")
@@ -3138,7 +3162,7 @@ impl App {
 
     /// Focused output as reported by Hyprland: connector, logical origin and
     /// logical height.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn focused_output() -> Option<(String, f64, f64, f64)> {
         let out = std::process::Command::new("hyprctl")
             .args(["-j", "monitors"])
@@ -3161,7 +3185,7 @@ impl App {
     }
 
     /// Pick the GDK monitor that matches the focused Hyprland output.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn gdk_monitor_named(x: f64, y: f64) -> Option<gtk::gdk::Monitor> {
         let display = gtk::gdk::Display::default()?;
         let list = display.monitors();
@@ -3194,7 +3218,23 @@ impl App {
         self.sync_size();
     }
 
-    #[cfg(unix)]
+    /// Same on macOS, against the screen under the pointer; AppKit window
+    /// settings (level, Spaces, click-through) are reapplied on every show.
+    #[cfg(target_os = "macos")]
+    fn place(&mut self) {
+        gtk::prelude::WidgetExt::realize(&self.window);
+        crate::mac::prepare(&self.window);
+        let mut k = 1.0;
+        if let Some(logical) = crate::mac::pointer_monitor_height() {
+            if logical > 100.0 {
+                k = (logical / 1080.0).clamp(0.70, 1.0);
+            }
+        }
+        self.ui_scale = k;
+        self.sync_size();
+    }
+
+    #[cfg(target_os = "linux")]
     fn place(&mut self) {
         let focused = Self::focused_output();
         let mut k = 1.0;
@@ -3246,6 +3286,17 @@ impl App {
             crate::win::place(&self.window);
             let window = self.window.clone();
             glib::timeout_add_local_once(Duration::from_millis(80), move || crate::win::place(&window));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::mac::prepare(&self.window);
+            crate::mac::place(&self.window);
+            crate::mac::activate();
+            let window = self.window.clone();
+            glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                crate::mac::prepare(&window);
+                crate::mac::place(&window);
+            });
         }
         // A (re)mapped surface starts with a full input region.
         self.input_rect = (-1, -1, -1, -1);
@@ -3532,6 +3583,8 @@ impl App {
             self.window.set_visible(false);
             self.visible = false;
             self.hiding = false;
+            #[cfg(target_os = "macos")]
+            crate::mac::release_focus();
         }
 
         self.list_busy = self.searching

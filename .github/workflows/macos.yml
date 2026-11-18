@@ -1,0 +1,25 @@
+name: macOS
+
+on:
+  push:
+    paths: ["src/**", "Cargo.*", "build.rs", "install-mac.sh", ".github/workflows/macos.yml"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias (Homebrew)
+        run: brew install gtk4 mpv pkgconf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compilar
+        run: cargo build --release
+      - name: Probar el CLI
+        run: ./target/release/marmota-music --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marmota-music-macos-arm64
+          path: target/release/marmota-music

@@ -2,6 +2,8 @@ mod db;
 mod draw;
 mod login;
 mod lyrics;
+#[cfg(target_os = "macos")]
+mod mac;
 mod model;
 mod mpv;
 mod paths;
@@ -137,6 +139,10 @@ fn main() {
         let r = std::env::var("MM_RENDERER").unwrap_or_else(|_| "cairo".into());
         std::env::set_var("GSK_RENDERER", r);
     }
+    // Started from Finder, a Login Item or launchd the PATH is just
+    // /usr/bin:/bin: add Homebrew's so yt-dlp is found (by us and by mpv).
+    #[cfg(target_os = "macos")]
+    mac::homebrew_path();
     paths::ensure_dirs();
     let cli = Cli::parse();
     let action = cli.cmd.unwrap_or(Action::Daemon);

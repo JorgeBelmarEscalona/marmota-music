@@ -2,7 +2,7 @@
 name = "marmota-music"
 version = "0.1.0"
 edition = "2021"
-description = "Liquid-glass music notch for Omarchy and Windows"
+description = "Liquid-glass music notch for Omarchy, macOS and Windows"
 license = "MIT"
 
 [dependencies]
@@ -22,9 +22,13 @@ libc = "0.2"
 sha1_smol = "1"
 tungstenite ={ version = "0.24", default-features = false, features = ["handshake"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 gtk4-layer-shell = "0.8"
 zbus = { version = "5", features = ["blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gdk4-macos = { version = "0.11", features = ["v4_8"] }
+objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 gdk4-win32 = "0.11"

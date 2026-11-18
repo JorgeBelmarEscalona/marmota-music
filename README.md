@@ -1,6 +1,6 @@
 # Marmota Music
 
-Reproductor de música nativo para Omarchy/Hyprland y Windows: una barra flotante tipo
+Reproductor de música nativo para Omarchy/Hyprland, macOS y Windows: una barra flotante tipo
 *notch* en la parte inferior de la pantalla, con estética de vidrio, portada,
 letras sincronizadas, vídeo dentro del notch y controles completos.
 Busca y reproduce desde **YouTube Music** y **Spotify**.
@@ -8,8 +8,8 @@ Busca y reproduce desde **YouTube Music** y **Spotify**.
 ![Vídeo y letra sincronizada](docs/video-letra.png)
 ![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
 
-- **Abrir/cerrar:** `Super + Shift + M` (en Windows `Win + Alt + M`), o `marmota-music toggle`
-- **Instalar:** `./install.sh` (ver [Instalar](#instalar)); en Windows, `install.ps1` (ver [Windows](#windows))
+- **Abrir/cerrar:** `Super + Shift + M` (en macOS `⌘ + ⇧ + M`, en Windows `Win + Alt + M`), o `marmota-music toggle`
+- **Instalar:** `./install.sh` (ver [Instalar](#instalar)); en macOS, `./install-mac.sh` (ver [macOS](#macos)); en Windows, `install.ps1` (ver [Windows](#windows))
 - Hecho en Rust + GTK4, pensado para gastar poco: ~1 % de CPU contraído.
 
 ## Uso
@@ -90,7 +90,7 @@ El instalador:
 
 ### Conectar cuentas
 
-Desde el propio notch, sin terminal (Linux y Windows): **Biblioteca →
+Desde el propio notch, sin terminal (Linux, macOS y Windows): **Biblioteca →
 Cuentas**.
 
 - **YouTube Music:** *Iniciar sesión con Google* abre una ventana de Chrome,
@@ -122,6 +122,52 @@ El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
 
 Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
 Para repetirlo: `marmota-music setup` o `./install.sh --setup`.
+
+## macOS
+
+```bash
+git clone https://github.com/JorgeBelmarEscalona/marmota-music
+cd marmota-music
+./install-mac.sh
+```
+
+Requiere [Homebrew](https://brew.sh). El instalador:
+
+1. instala con `brew` lo que falte (`gtk4`, `mpv`, `yt-dlp`, `pkgconf`,
+   `adwaita-icon-theme`, `rust`);
+2. compila y crea `~/Applications/Marmota Music.app` (sin icono en el Dock
+   ni barra de menús propia: `LSUIElement`), firmada *ad hoc*, y el comando
+   `marmota-music` en `$(brew --prefix)/bin`;
+3. registra un LaunchAgent (`~/Library/LaunchAgents/dev.marmota.music.plist`)
+   para que arranque al iniciar sesión, y lo arranca;
+4. la primera vez abre el asistente de cuentas.
+
+Es el mismo binario Rust + GTK4 con Cairo por CPU, así que gasta lo mismo
+que en Linux. Diferencias:
+
+| | Linux (Hyprland) | macOS |
+| --- | --- | --- |
+| Atajo | `Super + Shift + M` | `⌘ + ⇧ + M` (Carbon `RegisterEventHotKey`, no pide permiso de Accesibilidad); se cambia con la clave `hotkey` del config (p. ej. `"Ctrl + Option + P"`) |
+| Ventana | capa `gtk4-layer-shell` | ventana sin bordes a nivel *status*, en todos los Escritorios y sobre apps a pantalla completa, fuera de ⌘Tab; centrada sobre el Dock de la pantalla donde está el puntero |
+| Clics en la zona transparente | región de entrada | pasan a la ventana de atrás (`ignoresMouseEvents`, revisado ~20 veces por segundo solo mientras el notch está visible) |
+| Control externo / IPC con mpv | socket Unix en `$XDG_RUNTIME_DIR` | socket Unix en la carpeta temporal del usuario (`/var/folders/…/T/`) |
+| Configuración | `~/.config/marmota-music/config.json` | `~/Library/Application Support/marmota-music/config.json` |
+| Biblioteca / caché | `~/.local/share`, `~/.cache` | `~/Library/Application Support`, `~/Library/Caches` |
+| Spotify | búsqueda + reproducción con spotifyd | solo búsqueda; las canciones suenan desde YouTube Music |
+
+Notas:
+
+- **Iniciar sesión con Google:** en macOS cerrar la ventana no cierra el
+  navegador; cuando veas YouTube Music, ciérralo con **⌘Q** para que el notch
+  lea la sesión.
+- **Usar la sesión de un navegador:** Safari necesita *Acceso total al disco*
+  para la app que ejecuta `yt-dlp` (Ajustes del Sistema → Privacidad y
+  seguridad); Chrome, Brave y Edge piden permiso al llavero la primera vez.
+- Para compilar a mano: `brew install gtk4 mpv pkgconf` y
+  `cargo build --release`. `build.rs` agrega la carpeta de `libmpv` de
+  Homebrew al enlazador.
+- Desinstalar: `launchctl bootout gui/$(id -u)/dev.marmota.music`, y borrar
+  la app, el plist y `$(brew --prefix)/bin/marmota-music`.
 
 ## Windows
 
@@ -185,6 +231,8 @@ canción en YouTube Music.
 
 - **Spotify**: el vídeo y la radio automática vienen de YouTube Music.
 - **Apple Music**: descartado (no hay reproducción viable en Linux).
+- **macOS**: el vidrio no difumina lo que hay detrás (como en Hyprland, se
+  pinta con opacidad propia y la portada desenfocada).
 - **Blur de fondo**: Hyprland 0.56 no aplica `layer_rule` con `blur` en esta
   instalación (no hay `hyprpm`, así que tampoco HyprGlass). El vidrio se pinta
   con opacidad propia y la portada desenfocada como textura.

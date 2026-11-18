@@ -1680,7 +1680,9 @@ impl App {
                 }
                 RowItem::GoogleLogin => {
                     let name = self.login_browser.unwrap_or("el navegador");
-                    let text = if self.logging_in {
+                    let text = if self.logging_in && cfg!(target_os = "macos") {
+                        format!("Inicia sesión en {name} y ciérralo con ⌘Q al terminar")
+                    } else if self.logging_in {
                         format!("Inicia sesión en {name} y cierra esa ventana al terminar")
                     } else if self.importing {
                         "Importando tus listas…".to_string()

@@ -52,7 +52,21 @@ pub fn browser() -> Option<(&'static str, PathBuf)> {
         ];
         candidates.into_iter().find(|(_, p)| p.is_file())
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    {
+        let apps = [
+            ("Google Chrome", "Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ("Microsoft Edge", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            ("Brave", "Brave Browser.app/Contents/MacOS/Brave Browser"),
+            ("Chromium", "Chromium.app/Contents/MacOS/Chromium"),
+            ("Vivaldi", "Vivaldi.app/Contents/MacOS/Vivaldi"),
+        ];
+        let roots = [PathBuf::from("/Applications"), dirs::home_dir().unwrap_or_default().join("Applications")];
+        apps.into_iter().find_map(|(name, exe)| {
+            roots.iter().map(|r| r.join(exe)).find(|p| p.is_file()).map(|p| (name, p))
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let names = [
             ("Google Chrome", "google-chrome-stable"),
@@ -87,7 +101,7 @@ fn launch(exe: &Path, profile: &Path, args: &[&str]) -> std::io::Result<std::pro
         .args(["--no-first-run", "--no-default-browser-check"]);
     // Both launches must agree on how cookies are encrypted; the keyring a
     // desktop session picks may not be reachable headless.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     cmd.arg("--password-store=basic");
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
 }

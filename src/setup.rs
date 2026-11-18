@@ -51,7 +51,9 @@ pub fn open_url(url: &str) {
         c.arg("url.dll,FileProtocolHandler");
         c
     };
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = Command::new("xdg-open");
     let _ = cmd
         .arg(url)
@@ -60,7 +62,7 @@ pub fn open_url(url: &str) {
         .spawn();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn has(cmd: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {cmd}")])
@@ -91,7 +93,29 @@ pub fn browsers() -> Vec<(&'static str, String)> {
 }
 
 /// Browsers with a profile on this machine, as yt-dlp `--cookies-from-browser` specs.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+pub fn browsers() -> Vec<(&'static str, String)> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let support = home.join("Library/Application Support");
+    let candidates: [(&str, PathBuf, String); 8] = [
+        ("Safari", home.join("Library/Safari"), "safari".into()),
+        ("Firefox", support.join("Firefox"), "firefox".into()),
+        ("Zen", support.join("zen"), format!("firefox:{}", support.join("zen").display())),
+        ("Google Chrome", support.join("Google/Chrome"), "chrome".into()),
+        ("Brave", support.join("BraveSoftware/Brave-Browser"), "brave".into()),
+        ("Microsoft Edge", support.join("Microsoft Edge"), "edge".into()),
+        ("Vivaldi", support.join("Vivaldi"), "vivaldi".into()),
+        ("Chromium", support.join("Chromium"), "chromium".into()),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, dir, _)| dir.exists())
+        .map(|(name, _, spec)| (name, spec))
+        .collect()
+}
+
+/// Browsers with a profile on this machine, as yt-dlp `--cookies-from-browser` specs.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn browsers() -> Vec<(&'static str, String)> {
     let home = dirs::home_dir().unwrap_or_default();
     let cfg = dirs::config_dir().unwrap_or_default();
@@ -126,6 +150,11 @@ fn youtube() {
         return;
     }
     println!("  ¿En qué navegador tienes la sesión de YouTube iniciada?");
+    #[cfg(target_os = "macos")]
+    println!(
+        "  {D}Safari necesita «Acceso total al disco» para la Terminal; Chrome, Brave y Edge\n  \
+         pedirán permiso al llavero (pulsa «Permitir»).{X}"
+    );
     #[cfg(windows)]
     println!(
         "  {D}En Windows, Firefox es el más fiable: Chrome, Edge y Brave cifran sus cookies\n  \
@@ -164,7 +193,7 @@ fn youtube() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn spotifyd_conf() {
     let dir = dirs::config_dir().unwrap_or_default().join("spotifyd");
     let file = dir.join("spotifyd.conf");
@@ -187,15 +216,18 @@ fn spotifyd_conf() {
     ok(&format!("Configuración de spotifyd creada en {}", file.display()));
 }
 
-/// spotifyd plays through MPRIS (D-Bus), which Windows does not have.
-#[cfg(windows)]
+/// spotifyd plays through MPRIS (D-Bus), which Windows and macOS do not have.
+#[cfg(not(target_os = "linux"))]
 fn spotify_playback() {
     println!("\n  {B}Reproducir desde Spotify{X}");
+    #[cfg(target_os = "macos")]
+    println!("  {D}En macOS las canciones de Spotify suenan desde YouTube Music (la búsqueda");
+    #[cfg(windows)]
     println!("  {D}En Windows las canciones de Spotify suenan desde YouTube Music (la búsqueda");
     println!("  en Spotify funciona igual).{X}");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn spotify_playback() {
     println!("\n  {B}Reproducir desde Spotify{X} {D}(requiere Premium){X}");
     let creds = dirs::cache_dir().unwrap_or_default().join("spotifyd/oauth/credentials.json");
@@ -296,7 +328,9 @@ fn spotify() {
 pub fn shortcut() -> String {
     #[cfg(windows)]
     return crate::win::hotkey_label();
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    return crate::mac::hotkey_label();
+    #[cfg(all(unix, not(target_os = "macos")))]
     "Super + Shift + M".into()
 }
 
