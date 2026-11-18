@@ -65,6 +65,34 @@ else
   bad "No se pudo compilar el ayudante de Apple Music (detalles en /tmp/marmota-helper-build.log)"
 fi
 
+# MusicKit makes its own developer token, but only for an app signed by
+# your team whose App ID has the MusicKit service. Sets HELPER_SIGNED=1.
+HELPER_SIGNED=0
+sign_helper() {
+  [[ -d "$HELPER_APP" ]] || return 0
+  local team identity
+  team=$(sed -n 's/.*"apple_team_id"[[:space:]]*:[[:space:]]*"\([A-Z0-9]*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -1)
+  identity="${MARMOTA_SIGN_IDENTITY:-}"
+  if [[ -z "$identity" && -n "$team" ]]; then
+    identity=$(security find-identity -v -p codesigning 2>/dev/null \
+      | grep -E "\"(Apple Development|Developer ID Application|Mac Developer).*\($team\)\"" \
+      | head -1 | awk '{print $2}' || true)
+  fi
+  if [[ -n "$identity" ]] && codesign --force --sign "$identity" --identifier "$HELPER_ID" "$HELPER_APP" &>/dev/null; then
+    HELPER_SIGNED=1
+    ok "Ayudante de Apple Music firmado con tu equipo ($HELPER_ID)"
+  else
+    HELPER_SIGNED=0
+    codesign --force --sign - --identifier "$HELPER_ID" "$HELPER_APP" &>/dev/null || true
+    if [[ -n "$team" ]]; then
+      bad "No encontré un certificado de desarrollo del equipo $team en el llavero"
+      info "Xcode → Settings → Accounts → Manage Certificates → + Apple Development, y repite ./install-mac.sh"
+    fi
+  fi
+  # The app's own seal covers the helper: seal it again after re-signing.
+  codesign --force --sign - "$APP" &>/dev/null || true
+}
+
 step "3 · Aplicación"
 # Stop a running notch before replacing its binary.
 if pgrep -x marmota-music &>/dev/null; then
@@ -100,31 +128,11 @@ if [[ -n "$HELPER_BIN" ]]; then
   install -m755 "$HELPER_BIN" "$HELPER_APP/Contents/MacOS/marmota-apple-music"
   sed -e "s/__BUNDLE_ID__/$HELPER_ID/" -e "s/__VERSION__/$VERSION/g" \
     macos/AppleMusicHelper/Info.plist > "$HELPER_APP/Contents/Info.plist"
-  # MusicKit makes its own developer token, but only for an app signed by
-  # your team whose App ID has the MusicKit service.
-  TEAM=$(sed -n 's/.*"apple_team_id"[[:space:]]*:[[:space:]]*"\([A-Z0-9]*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -1)
-  IDENTITY="${MARMOTA_SIGN_IDENTITY:-}"
-  if [[ -z "$IDENTITY" && -n "$TEAM" ]]; then
-    IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-      | grep -E "\"(Apple Development|Developer ID Application|Mac Developer).*\($TEAM\)\"" \
-      | head -1 | awk '{print $2}')
-  fi
-  if [[ -n "$IDENTITY" ]] && codesign --force --sign "$IDENTITY" --identifier "$HELPER_ID" "$HELPER_APP" &>/dev/null; then
-    ok "Ayudante de Apple Music firmado con tu equipo ($HELPER_ID)"
-  else
-    codesign --force --sign - --identifier "$HELPER_ID" "$HELPER_APP" &>/dev/null || true
-    if [[ -z "$TEAM" ]]; then
-      info "Configura Apple Music (marmota-music setup apple) y repite ./install-mac.sh para firmar el ayudante"
-    else
-      bad "No encontré un certificado de desarrollo del equipo $TEAM en el llavero"
-      info "Xcode → Settings → Accounts → Manage Certificates → + Apple Development, y repite ./install-mac.sh"
-    fi
-    info "Mientras tanto, las canciones de Apple Music suenan desde YouTube Music"
-  fi
+  sign_helper
 fi
 # Ad-hoc signature, so Gatekeeper and the keychain recognize it between runs
-# (the helper keeps its own signature).
-codesign --force --sign - "$APP" &>/dev/null || true
+# (the helper keeps its own signature; sign_helper sealed it already).
+[[ -d "$HELPER_APP" ]] || codesign --force --sign - "$APP" &>/dev/null || true
 ok "Instalada en $APP"
 
 # The CLI (marmota-music toggle, status…) on the PATH. A wrapper rather
@@ -163,5 +171,44 @@ if [[ "${1:-}" != "--setup" ]] && [[ -f "$CONFIG" ]] && grep -qE '"(setup_done|c
   ok "Tus cuentas ya están configuradas"
   info "Para repetirlo: ./install-mac.sh --setup"
 else
-  "$EXE" setup
+  # The Apple Music check waits for step 6, once the helper is signed.
+  MARMOTA_SKIP_APPLE_CHECK=1 "$EXE" setup
+fi
+
+step "6 · Apple Music"
+HELPER_EXE="$HELPER_APP/Contents/MacOS/marmota-apple-music"
+if [[ ! -x "$HELPER_EXE" ]]; then
+  info "Sin ayudante de MusicKit: las canciones de Apple Music suenan desde YouTube Music"
+  exit 0
+fi
+if ! grep -qE '"apple_key_file"[[:space:]]*:[[:space:]]*"[^"]+' "$CONFIG" 2>/dev/null; then
+  echo "  Para buscar y reproducir Apple Music hace falta tu clave MusicKit."
+  MARMOTA_SKIP_APPLE_CHECK=1 "$EXE" setup apple || true
+fi
+if ! grep -qE '"apple_team_id"[[:space:]]*:[[:space:]]*"[A-Z0-9]+' "$CONFIG" 2>/dev/null; then
+  info "Sin clave de Apple Music: puedes configurarla luego con ./install-mac.sh"
+  exit 0
+fi
+# Now that the Team ID is known, sign with it and restart the notch so it
+# picks up the signed helper.
+if (( ! HELPER_SIGNED )); then
+  sign_helper
+  if (( HELPER_SIGNED )); then
+    launchctl bootout "gui/$(id -u)/$AGENT_ID" &>/dev/null || true
+    sleep 1
+    launchctl bootstrap "gui/$(id -u)" "$AGENT"
+  fi
+fi
+if (( ! HELPER_SIGNED )); then
+  info "Las canciones de Apple Music suenan desde YouTube Music hasta que el ayudante esté firmado"
+  exit 0
+fi
+echo "  Comprobando Apple Music (macOS puede pedirte permiso)…"
+if "$HELPER_EXE" --check; then
+  ok "Listo: busca una canción con el ícono rojo de Apple Music y sonará con tu suscripción"
+  info "Prueba de sonido de 8 s: marmota-music apple-test play"
+else
+  bad "Apple Music todavía no puede reproducir; mientras tanto suena desde YouTube Music"
+  info "Si el error habla del token: en developer.apple.com → Identifiers → + → App IDs,"
+  info "Bundle ID explícito $HELPER_ID, marca MusicKit en App Services y repite ./install-mac.sh"
 fi

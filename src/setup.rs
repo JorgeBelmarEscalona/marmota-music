@@ -419,16 +419,14 @@ fn apple_playback() {
             println!("  {D}Instálalo con ./install-mac.sh (necesita macOS 14 y tu Team ID).{X}");
             return;
         }
+        if std::env::var_os("MARMOTA_SKIP_APPLE_CHECK").is_some() {
+            // install-mac.sh signs the helper and checks it right after.
+            return;
+        }
         println!("  Para reproducir con tu suscripción, macOS pedirá acceso a Apple Music.");
-        match crate::apple_music::authorize() {
-            Some(line) if line.contains("authorized") && !line.contains("sin suscripción") => {
-                ok("Reproducción con tu suscripción de Apple Music lista");
-            }
-            Some(line) => {
-                bad(&line);
-                println!("  {D}Sus canciones suenan desde YouTube Music. Permítelo en Ajustes del Sistema →{X}");
-                println!("  {D}Privacidad y seguridad → Archivos multimedia y Apple Music.{X}");
-            }
+        match crate::apple_music::check(&["--check"]) {
+            Some(true) => ok("Reproducción con tu suscripción de Apple Music lista"),
+            Some(false) => println!("  {D}Mientras tanto, sus canciones suenan desde YouTube Music.{X}"),
             None => bad("El ayudante de Apple Music no respondió"),
         }
     }

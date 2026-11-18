@@ -138,12 +138,13 @@ pub fn helper_path() -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// Ask for MusicKit access in the foreground (`setup apple`). Returns the
-/// helper's one-line answer.
+/// Run one of the helper's one-shot checks (`--authorize`, `--check`,
+/// `--check --play`) in the foreground, printing what it reports. True when
+/// every step passed.
 #[cfg(target_os = "macos")]
-pub fn authorize() -> Option<String> {
-    let out = std::process::Command::new(helper_path()?).arg("--authorize").output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+pub fn check(args: &[&str]) -> Option<bool> {
+    let status = std::process::Command::new(helper_path()?).args(args).status().ok()?;
+    Some(status.success())
 }
 
 /// Diagnostics: what Apple answers for a song's lyrics through MusicKit.

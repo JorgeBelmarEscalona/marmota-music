@@ -77,8 +77,9 @@ enum Action {
     /// Show the YouTube account the saved session belongs to (diagnostics).
     #[command(hide = true)]
     AccountTest,
-    /// Apple Music diagnostics: `apple-test` (helper and permission) or
-    /// `apple-test lyrics <id>` (what Apple answers for a song's lyrics).
+    /// Apple Music diagnostics: `apple-test` (helper, permission, catalog),
+    /// `apple-test play` (also a few seconds of sound) or `apple-test lyrics
+    /// <id>` (what Apple answers for a song's lyrics).
     #[command(hide = true)]
     AppleTest { what: Option<String>, id: Option<String> },
     /// Open the search tab, optionally running a query.
@@ -252,11 +253,14 @@ fn apple_test(what: Option<&str>, id: Option<&str>) {
                 None => println!("letra con MusicKit: el ayudante no respondió"),
             }
         }
+        // `apple-test play`: also play a few seconds for real.
         _ => {
             #[cfg(target_os = "macos")]
-            match apple_music::authorize() {
-                Some(line) => println!("{line}"),
-                None => println!("el ayudante no respondió"),
+            {
+                let args: &[&str] = if what == Some("play") { &["--check", "--play"] } else { &["--check"] };
+                if apple_music::check(args).is_none() {
+                    println!("el ayudante no respondió");
+                }
             }
         }
     }

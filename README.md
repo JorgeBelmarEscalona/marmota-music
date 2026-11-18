@@ -334,17 +334,16 @@ cuyo App ID tenga el servicio MusicKit. Hazlo una vez:
 2. Necesitas un certificado **Apple Development** (o **Developer ID
    Application**) de ese equipo en el llavero. Si no lo tienes: Xcode →
    *Settings* → *Accounts* → tu cuenta → *Manage Certificates* → **+**.
-3. Configura la clave (pasos de arriba, para que el instalador sepa tu Team
-   ID) y vuelve a ejecutar `./install-mac.sh`: firma el ayudante con el
-   certificado de tu Team ID. Con otro certificado:
+3. Ejecuta `./install-mac.sh`. Si falta, te pide la clave MusicKit (pasos
+   de arriba), firma el ayudante con el certificado de tu Team ID, reinicia el
+   notch, pide a macOS el acceso a Apple Music y comprueba permiso,
+   suscripción y catálogo. Con otro certificado:
    `MARMOTA_SIGN_IDENTITY="Apple Development: …" ./install-mac.sh`; con otro
-   Bundle ID: `MARMOTA_HELPER_ID=…`.
-4. `marmota-music setup apple` pide a macOS el acceso a Apple Music (o lo pide
-   la primera canción). Se puede cambiar en *Ajustes del Sistema →
-   Privacidad y seguridad → Archivos multimedia y Apple Music*.
+   Bundle ID: `MARMOTA_HELPER_ID=…`. El permiso se puede cambiar en *Ajustes
+   del Sistema → Privacidad y seguridad → Archivos multimedia y Apple Music*.
 
-`marmota-music apple-test` muestra si el ayudante está instalado, el permiso
-y si la suscripción puede reproducir el catálogo.
+`marmota-music apple-test` repite la comprobación y `marmota-music apple-test
+play` además hace sonar 8 s de una canción con tu suscripción.
 
 Si algo falla (sin ayudante, sin permiso, sin suscripción, App ID sin
 MusicKit, macOS 13 o anterior, Linux y Windows), la canción suena buscando la

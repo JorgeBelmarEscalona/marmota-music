@@ -15,7 +15,8 @@
 //          {"ev":"error","id":"…","msg":"…"}
 //
 // `marmota-apple-music --authorize` asks for access once and exits (used by
-// `marmota-music setup apple`). The helper exits when stdin closes, so it
+// `marmota-music setup apple`); `--check` also tries the catalog, and
+// `--check --play` plays a few seconds. The helper exits when stdin closes, so it
 // never outlives the notch.
 
 import AppKit
@@ -268,15 +269,55 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let bridge = MainActor.assumeIsolated { Bridge() }
 
-if CommandLine.arguments.contains("--authorize") {
+let args = CommandLine.arguments
+if args.contains("--authorize") || args.contains("--check") {
+    // One-shot checks for the installer and `marmota-music apple-test`:
+    // permission, subscription, MusicKit's own token (a catalog search) and,
+    // with --play, a few seconds of real playback. Exits 0 when all pass.
     Task { @MainActor in
+        func say(_ s: String) { print(s); fflush(stdout) }
         let s = await bridge.authorize()
-        var line = "Apple Music: \(bridge.authName(s))"
-        if s == .authorized, let sub = try? await MusicSubscription.current {
-            line += sub.canPlayCatalogContent ? " · suscripción activa" : " · sin suscripción"
+        guard s == .authorized else {
+            say("✗ permiso: \(bridge.authName(s)) (Ajustes del Sistema → Privacidad y seguridad → Archivos multimedia y Apple Music)")
+            exit(1)
         }
-        print(line)
-        exit(s == .authorized ? 0 : 1)
+        say("✓ permiso de Apple Music concedido")
+        guard let sub = try? await MusicSubscription.current, sub.canPlayCatalogContent else {
+            say("✗ esta cuenta no tiene una suscripción de Apple Music activa (o la app Música no ha iniciado sesión)")
+            exit(1)
+        }
+        say("✓ suscripción activa")
+        guard args.contains("--check") else { exit(0) }
+        var req = MusicCatalogSearchRequest(term: "Bohemian Rhapsody Queen", types: [Song.self])
+        req.limit = 1
+        let song: Song
+        do {
+            guard let first = try await req.response().songs.first else {
+                say("✗ el catálogo no devolvió canciones")
+                exit(1)
+            }
+            song = first
+        } catch {
+            say("✗ catálogo: \(bridge.describe(error))")
+            say("  Revisa que el App ID \(Bundle.main.bundleIdentifier ?? "?") tenga MusicKit en App Services")
+            exit(1)
+        }
+        say("✓ token de MusicKit válido (catálogo: «\(song.title)» de \(song.artistName), id \(song.id.rawValue))")
+        guard args.contains("--play") else { exit(0) }
+        do {
+            bridge.player.queue = ApplicationMusicPlayer.Queue(for: [song])
+            try await bridge.player.play()
+        } catch {
+            say("✗ reproducción: \(bridge.describe(error))")
+            exit(1)
+        }
+        try? await Task.sleep(nanoseconds: 8_000_000_000)
+        let pos = bridge.player.playbackTime
+        let ok = bridge.player.state.playbackStatus == .playing && pos > 2
+        bridge.player.stop()
+        say(ok ? String(format: "✓ sonó %.1f s con tu suscripción", pos)
+               : "✗ no llegó a sonar (estado: \(bridge.statusName(bridge.player.state.playbackStatus)), \(pos) s)")
+        exit(ok ? 0 : 1)
     }
 } else {
     // Commands come in on a background thread and run on the main one, in order.
