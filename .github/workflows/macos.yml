@@ -2,7 +2,7 @@ name: macOS
 
 on:
   push:
-    paths: ["src/**", "Cargo.*", "build.rs", "install-mac.sh", ".github/workflows/macos.yml"]
+    paths: ["src/**", "Cargo.*", "build.rs", "install-mac.sh", "macos/**", ".github/workflows/macos.yml"]
   pull_request:
   workflow_dispatch:
 
@@ -19,6 +19,15 @@ jobs:
         run: cargo build --release
       - name: Probar el CLI
         run: ./target/release/marmota-music --help
+      # Sin firmar: MusicKit solo funciona firmado con el equipo del usuario.
+      - name: Compilar el ayudante de Apple Music
+        run: swift build -c release --package-path macos/AppleMusicHelper
+      - name: Probar el ayudante
+        # Sin bundle ni firma MusicKit puede negarse; solo es informativo.
+        continue-on-error: true
+        run: |
+          BIN="$(swift build -c release --package-path macos/AppleMusicHelper --show-bin-path)/MarmotaAppleMusic"
+          echo '{"cmd":"status"}' | "$BIN" | tee /dev/stderr | grep -q '"ev":"status"'
       - uses: actions/upload-artifact@v4
         with:
           name: marmota-music-macos-arm64

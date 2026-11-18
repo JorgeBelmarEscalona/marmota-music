@@ -267,6 +267,8 @@ pub enum MpvCmd {
     /// Turn video on/off; with a URL, switch to that stream (the music video
     /// of the current song) keeping the position.
     Video(bool, Option<String>),
+    /// Silence mpv (the picture of a song that Apple Music plays).
+    Mute(bool),
     #[allow(dead_code)]
     Stop,
 }
@@ -374,6 +376,9 @@ impl Mpv {
     }
     pub fn video(&self, on: bool, url: Option<String>) {
         let _ = self.tx.send(MpvCmd::Video(on, url));
+    }
+    pub fn mute(&self, on: bool) {
+        let _ = self.tx.send(MpvCmd::Mute(on));
     }
     #[allow(dead_code)]
     pub fn stop(&self) {
@@ -538,6 +543,9 @@ fn run(sock: std::path::PathBuf, rx: Receiver<MpvCmd>, shared: Arc<Mutex<Playbac
                             s.has_video = false;
                         }
                     }
+                }
+                MpvCmd::Mute(on) => {
+                    send(&mut stream, &mut rid, json!(["set_property", "mute", on]));
                 }
                 MpvCmd::Stop => {
                     retry_at = None;

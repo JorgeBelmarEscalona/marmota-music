@@ -341,6 +341,7 @@ pub fn apple() {
     if crate::apple_api::configured() {
         ok(&format!("La búsqueda en Apple Music ya está conectada (país: {})", crate::apple_api::storefront()));
         if !yes("  ¿Cambiar la clave?", false) {
+            apple_playback();
             return;
         }
     } else if !yes("  ¿Tienes una cuenta de Apple Developer?", false) {
@@ -392,7 +393,7 @@ pub fn apple() {
         match crate::apple_api::search("Bohemian Rhapsody") {
             Ok(t) if !t.is_empty() => {
                 ok("Búsqueda en Apple Music conectada");
-                println!("  {D}Sus canciones suenan desde YouTube Music por ahora.{X}");
+                apple_playback();
                 return;
             }
             Ok(_) => bad("Apple Music respondió sin resultados (¿el país es correcto?)"),
@@ -406,6 +407,33 @@ pub fn apple() {
             return;
         }
     }
+}
+
+/// Ask macOS for access to Apple Music, so songs play with the user's
+/// subscription instead of from YouTube Music.
+fn apple_playback() {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::apple_music::helper_path().is_none() {
+            println!("  {D}Sus canciones suenan desde YouTube Music: el ayudante de Apple Music no está instalado.{X}");
+            println!("  {D}Instálalo con ./install-mac.sh (necesita macOS 14 y tu Team ID).{X}");
+            return;
+        }
+        println!("  Para reproducir con tu suscripción, macOS pedirá acceso a Apple Music.");
+        match crate::apple_music::authorize() {
+            Some(line) if line.contains("authorized") && !line.contains("sin suscripción") => {
+                ok("Reproducción con tu suscripción de Apple Music lista");
+            }
+            Some(line) => {
+                bad(&line);
+                println!("  {D}Sus canciones suenan desde YouTube Music. Permítelo en Ajustes del Sistema →{X}");
+                println!("  {D}Privacidad y seguridad → Archivos multimedia y Apple Music.{X}");
+            }
+            None => bad("El ayudante de Apple Music no respondió"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    println!("  {D}Sus canciones suenan desde YouTube Music (la reproducción con Apple Music es solo para macOS).{X}");
 }
 
 /// Write a secret readable by this user only.

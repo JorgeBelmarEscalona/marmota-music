@@ -15,6 +15,7 @@ use crate::lyrics;
 use crate::model::*;
 use crate::mpv::{self, Mpv};
 use crate::paths;
+use crate::apple_music::{AppleMusic, Cmd as AppleCmd};
 use crate::spotify::{self, Cmd as SpotifyCmd, Spotify};
 use crate::theme::{self, Rgb};
 use crate::{apple_api, rank, spotify_api, yt, ytm};
@@ -373,6 +374,16 @@ pub struct App {
     pub source: Source,
     pub spotify: Spotify,
     pub spotify_seen: String,
+    /// MusicKit helper (macOS): Apple Music songs with the user's subscription.
+    pub apple: AppleMusic,
+    pub am_started: Instant,
+    /// Apple Music is really playing our song (not still loading).
+    pub am_confirmed: bool,
+    pub am_ended_seen: u64,
+    /// Last time the silent music video was lined up with Apple Music.
+    pub am_sync_at: Instant,
+    /// Position report pace asked of the helper (seconds).
+    pub am_interval: f64,
     pub yt_track: Option<Track>,
     pub yt_pos: f64,
     pub yt_playing: bool,
@@ -773,6 +784,12 @@ fn build(
         source: Source::YouTube,
         spotify: Spotify::start(),
         spotify_seen: String::new(),
+        apple: AppleMusic::start(),
+        am_started: Instant::now(),
+        am_confirmed: false,
+        am_ended_seen: 0,
+        am_sync_at: Instant::now(),
+        am_interval: 0.0,
         yt_track: None,
         yt_pos: 0.0,
         yt_playing: false,
@@ -1941,6 +1958,16 @@ impl App {
             self.dirty = true;
             return;
         }
+        if self.source == Source::Apple {
+            self.apple.send(if self.playing { AppleCmd::Pause } else { AppleCmd::Resume });
+            // The silent video follows at once instead of at the next sync.
+            if self.has_video {
+                self.mpv.pause(self.playing);
+            }
+            self.playing = !self.playing;
+            self.dirty = true;
+            return;
+        }
         if self.playing {
             self.mpv.pause(true);
             self.playing = false;
@@ -1959,6 +1986,11 @@ impl App {
         self.pos = pos;
         if self.source == Source::Spotify {
             self.spotify.send(SpotifyCmd::Seek(pos));
+        } else if self.source == Source::Apple {
+            self.apple.send(AppleCmd::Seek(pos));
+            if self.has_video {
+                self.mpv.seek(pos);
+            }
         } else {
             self.mpv.seek(pos);
         }
@@ -1989,7 +2021,13 @@ impl App {
                 self.expand();
             }
         } else {
-            self.mpv.video(false, None);
+            if self.source == Source::Apple {
+                // mpv only had the picture: nothing left for it to play.
+                self.mpv.stop();
+                self.has_video = false;
+            } else {
+                self.mpv.video(false, None);
+            }
             self.video_surface = None;
             self.set_status("Modo audio");
         }
@@ -2003,6 +2041,9 @@ impl App {
         std::thread::spawn(move || {
             let vid = if t.source == "youtube" {
                 ytm::music_video(&t.title, &t.artist).filter(|v| *v != t.id)
+            } else if t.is_apple() {
+                // Apple's own videos are FairPlay: show YouTube's, silently.
+                ytm::music_video(&lyrics::clean_title(&t.title), &lyrics::main_artist(&t.artist))
             } else {
                 None
             };
@@ -2026,7 +2067,12 @@ impl App {
                 if self.video {
                     self.set_video(false);
                 }
-                self.yt_track = self.track.clone();
+                // mpv has nothing of an Apple Music song to resume later.
+                self.yt_track = if self.source == Source::Apple { None } else { self.track.clone() };
+                if self.source == Source::Apple {
+                    self.apple.send(AppleCmd::Pause);
+                    self.mpv.mute(false);
+                }
                 self.yt_pos = self.pos;
                 self.yt_playing = self.playing;
                 self.mpv.pause(true);
@@ -2040,6 +2086,10 @@ impl App {
             }
             Source::YouTube => {
                 self.spotify.send(SpotifyCmd::Pause);
+                if self.source == Source::Apple {
+                    self.apple.send(AppleCmd::Stop);
+                    self.mpv.mute(false);
+                }
                 self.source = Source::YouTube;
                 if let Some(t) = self.yt_track.clone() {
                     self.track = Some(t.clone());
@@ -2058,6 +2108,8 @@ impl App {
                 }
                 self.set_status("Fuente: YouTube Music");
             }
+            // Apple Music is never picked by hand: its songs pick it.
+            Source::Apple => return,
         }
         self.dirty = true;
     }
@@ -2108,6 +2160,9 @@ impl App {
         self.volume = value.clamp(0.0, 100.0);
         if self.source == Source::Spotify {
             self.spotify.send(SpotifyCmd::Volume(self.volume / 100.0));
+        } else if self.source == Source::Apple {
+            // MusicKit has no volume of its own on the Mac.
+            self.set_status("Apple Music usa el volumen del sistema");
         } else {
             self.mpv.volume(self.volume);
         }
@@ -2267,6 +2322,10 @@ impl App {
     }
 
     fn begin_track(&mut self, t: Track) {
+        if t.is_apple() && self.apple.snapshot().usable() {
+            self.start_apple(t);
+            return;
+        }
         if t.is_spotify() || t.is_apple() {
             let sp = self.spotify.snapshot();
             if t.is_spotify() && (sp.available || sp.standby) {
@@ -2284,6 +2343,12 @@ impl App {
             return;
         }
         self.spotify_queue = false;
+        if self.source == Source::Apple {
+            self.apple.send(AppleCmd::Stop);
+            self.source = Source::YouTube;
+            self.yt_track = None;
+        }
+        self.mpv.mute(false);
         if self.source == Source::Spotify {
             // Local tracks and YouTube results always play through mpv.
             self.spotify.send(SpotifyCmd::Pause);
@@ -2312,10 +2377,67 @@ impl App {
         self.hiding = false;
     }
 
+    /// Play an Apple Music song with the user's subscription (MusicKit
+    /// helper). mpv only shows its music video, muted, if video is on.
+    fn start_apple(&mut self, t: Track) {
+        self.apple.clear_error();
+        if self.source == Source::Spotify {
+            self.spotify.send(SpotifyCmd::Pause);
+        }
+        self.spotify_queue = false;
+        self.mpv.mute(true);
+        self.mpv.stop();
+        self.has_video = false;
+        self.video_surface = None;
+        self.source = Source::Apple;
+        self.yt_track = None;
+        self.apple.send(AppleCmd::Play(t.id.trim_start_matches("am_").to_string()));
+        self.am_started = Instant::now();
+        self.am_confirmed = false;
+        self.am_ended_seen = self.apple.snapshot().ended;
+        self.am_sync_at = Instant::now();
+        self.track = Some(t.clone());
+        self.pos = 0.0;
+        self.dur = t.duration;
+        self.playing = true;
+        self.drawn_pos = -1.0;
+        if self.video {
+            self.video_at = Instant::now();
+            self.find_video();
+        }
+        self.db.touch_played(&t);
+        self.current_saved = self.db.is_saved(&t.id);
+        self.start_lyrics(t.clone());
+        self.start_cover(&t);
+        self.dirty = true;
+        self.hiding = false;
+    }
+
+    /// Leave Apple Music for this song (helper refused or never answered)
+    /// and play the same song from YouTube Music.
+    fn apple_fallback(&mut self, why: &str) {
+        self.apple.clear_error();
+        self.apple.send(AppleCmd::Stop);
+        self.mpv.mute(false);
+        self.source = Source::YouTube;
+        self.set_status(&format!("{why} · suena desde YouTube Music"));
+        let Some(t) = self.track.clone() else { return };
+        self.resolving = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let twin = youtube_twin(&t);
+            let _ = tx.send(Event::Substitute(t.id.clone(), twin));
+        });
+    }
+
     /// Play a Spotify track on the Connect device (spotifyd) through MPRIS.
     fn start_spotify(&mut self, t: Track) {
         if self.video {
             self.set_video(false);
+        }
+        if self.source == Source::Apple {
+            self.apple.send(AppleCmd::Stop);
+            self.mpv.mute(false);
         }
         self.mpv.pause(true);
         if self.source != Source::Spotify {
@@ -3097,6 +3219,21 @@ impl App {
                     _ => {}
                 }
             }
+            Event::VideoFound(id, vid) if self.source == Source::Apple => {
+                if self.video && self.track.as_ref().is_some_and(|t| t.id == id) {
+                    match vid {
+                        Some(v) => {
+                            self.video_at = Instant::now();
+                            self.mpv.mute(true);
+                            self.mpv.video(true, Some(format!("https://www.youtube.com/watch?v={v}")));
+                            // Line it up with Apple Music as soon as it shows.
+                            self.am_sync_at = Instant::now() - Duration::from_secs(10);
+                            self.set_status("Cargando vídeo…");
+                        }
+                        None => self.set_status("No encontré el videoclip de esta canción"),
+                    }
+                }
+            }
             Event::VideoFound(id, vid) => {
                 if self.video && self.track.as_ref().is_some_and(|t| t.id == id) {
                     self.video_at = Instant::now();
@@ -3119,6 +3256,8 @@ impl App {
             Event::CoverDone(id, px) => {
                 self.apply_cover(&id, px);
             }
+            // mpv only shows the muted video; Apple Music says when songs end.
+            Event::Ended if self.source == Source::Apple => {}
             Event::Ended => {
                 if self.repeat == Repeat::One {
                     if let Some(t) = self.track.clone() {
@@ -3493,6 +3632,12 @@ impl App {
                 format!("Reintentando… ({}/4)", self.retry)
             } else if self.source == Source::Spotify {
                 "Conectando con Spotify…".into()
+            } else if self.source == Source::Apple {
+                if self.apple.snapshot().auth == "notDetermined" {
+                    "Permite el acceso a Apple Music…".into()
+                } else {
+                    "Conectando con Apple Music…".into()
+                }
             } else if self.load_t0.elapsed().as_secs() >= 8 {
                 "YouTube está tardando, sigo intentando…".into()
             } else {
@@ -3688,6 +3833,73 @@ impl App {
             self.cache_ahead = p.cache_ahead;
             (p.pos, p.dur, p.playing, p.has_video)
         };
+        let (mpv_pos, mpv_playing) = (pos, playing);
+        if self.source == Source::Apple {
+            let am = self.apple.snapshot();
+            let ours = self.track.as_ref().map(|t| t.id.trim_start_matches("am_").to_string()).unwrap_or_default();
+            let error = am.error.as_ref().filter(|(id, _)| *id == ours).map(|(_, m)| m.clone());
+            // The authorization prompt may wait for the user; a load may not.
+            let waited = self.am_started.elapsed();
+            let stuck = !self.am_confirmed
+                && ((am.auth == "authorized" && waited > Duration::from_secs(20))
+                    || waited > Duration::from_secs(120));
+            if let Some(msg) = error {
+                self.apple_fallback(&msg);
+                return;
+            }
+            if !am.available || stuck {
+                self.apple_fallback("Apple Music no respondió");
+                return;
+            }
+            if am.id == ours && am.playing() {
+                self.am_confirmed = true;
+            }
+            if am.ended != self.am_ended_seen {
+                self.am_ended_seen = am.ended;
+                if am.ended_id == ours && self.am_confirmed {
+                    if self.repeat == Repeat::One {
+                        self.apple.send(AppleCmd::Play(ours.clone()));
+                        self.am_started = Instant::now();
+                        self.am_confirmed = false;
+                    } else {
+                        self.advance(true);
+                        return;
+                    }
+                }
+            }
+            if self.am_confirmed && am.id == ours {
+                pos = am.position();
+                dur = am.dur;
+                playing = am.playing();
+            } else {
+                pos = 0.0;
+                dur = 0.0;
+                playing = self.playing;
+            }
+            self.loading = !self.am_confirmed;
+            self.buffering = false;
+            self.buffer_t0 = None;
+            self.failed = false;
+            self.retry = 0;
+            self.cache_ahead = 0.0;
+            // The YouTube video runs muted on its own clock: every couple of
+            // seconds, pull it back to Apple Music's if it drifted.
+            if self.video && has_video && self.am_confirmed && self.am_sync_at.elapsed() >= Duration::from_secs(2) {
+                self.am_sync_at = Instant::now();
+                if mpv_playing != playing {
+                    self.mpv.pause(!playing);
+                }
+                if (mpv_pos - pos).abs() > 0.3 {
+                    self.mpv.seek(pos);
+                }
+            }
+            // Position reports: often while the notch shows, rarely while hidden.
+            let pace = if self.visible { 0.5 } else { 5.0 };
+            if pace != self.am_interval {
+                self.am_interval = pace;
+                self.apple.send(AppleCmd::Interval(pace));
+            }
+        }
         if self.source == Source::Spotify {
             let sp = self.spotify.snapshot();
             let waking = sp.standby && self.sp_started.elapsed() < Duration::from_secs(10);

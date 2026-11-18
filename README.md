@@ -3,7 +3,7 @@
 Reproductor de música nativo para Omarchy/Hyprland, macOS y Windows: una barra flotante tipo
 *notch* en la parte inferior de la pantalla, con estética de vidrio, portada,
 letras sincronizadas, vídeo dentro del notch y controles completos.
-Busca y reproduce desde **YouTube Music** y **Spotify**, y busca también en **Apple Music**.
+Busca y reproduce desde **YouTube Music**, **Spotify** y **Apple Music** (con tu suscripción en macOS).
 
 ![Vídeo y letra sincronizada](docs/video-letra.png)
 ![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
@@ -46,6 +46,7 @@ altura lógica: 1040×612 en una pantalla 1440p, 832×490 en el panel del portá
 | Audio y vídeo | libmpv embebido (render por software al notch) con IPC JSON por socket |
 | Búsqueda / inicio / álbumes / listas / radio | API InnerTube de YouTube Music (`src/ytm.rs`); yt-dlp como respaldo y para listas privadas |
 | Búsqueda en Spotify / Apple Music | Spotify Web API (`src/spotify_api.rs`); Apple Music API con un token ES256 firmado con tu clave MusicKit (`src/apple_api.rs`) |
+| Reproducción de Apple Music (macOS) | ayudante Swift con MusicKit `ApplicationMusicPlayer` (`macos/AppleMusicHelper`), JSON por stdin/stdout (`src/apple_music.rs`) |
 | Letras | LRCLIB (exacta y búsqueda) y NetEase de respaldo; solo se cachean las sincronizadas |
 | Portadas | descargadas y cacheadas en `~/.cache/marmota-music/art/` |
 | Biblioteca / listas | SQLite (`~/.local/share/marmota-music/marmota-music.db`) |
@@ -213,7 +214,8 @@ El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
   búsqueda y valida las claves → si es Premium, instala `spotifyd`, abre el
   inicio de sesión y lo deja arrancando solo.
 - **Apple Music:** ¿tienes Apple Developer? → Team ID, Key ID, archivo
-  `.p8` y país → prueba una búsqueda (`marmota-music setup apple` para solo
+  `.p8` y país → prueba una búsqueda → en macOS pide el acceso a Apple Music
+  para reproducir con tu suscripción (`marmota-music setup apple` para solo
   este paso).
 
 Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
@@ -312,15 +314,61 @@ por tu usuario) y el config guarda `apple_team_id`, `apple_key_id`,
 con ella cualquiera puede usar la API a tu nombre. *Quitar clave* en
 Cuentas la borra.
 
-Por ahora una canción de Apple Music se reproduce buscando la misma
-canción en YouTube Music (igual que Spotify sin `spotifyd`), con letras,
-vídeo y radio. Reproducirla con tu suscripción de Apple Music necesita
-MusicKit (Swift) y llegará en una segunda fase, solo para macOS.
+### Reproducir con tu suscripción (macOS 14 o posterior)
+
+En macOS las canciones de Apple Music suenan con **tu suscripción**, a
+través de un pequeño ayudante en Swift sin ventana (`macos/AppleMusicHelper`,
+MusicKit `ApplicationMusicPlayer`). `install-mac.sh` lo compila y lo deja en
+`Marmota Music.app/Contents/Helpers/Marmota Apple Music.app`. El notch le
+manda play, pausa y salto por stdin y recibe posición, duración, estado y fin
+de pista por stdout (cada 0,5 s con el notch abierto, cada 5 s oculto, y
+nada en pausa).
+
+MusicKit crea su propio token, pero solo para una app firmada por tu equipo
+cuyo App ID tenga el servicio MusicKit. Hazlo una vez:
+
+1. *Certificates, IDs & Profiles* → **Identifiers** → **+** → **App IDs** →
+   **App**: descripción «Marmota Music Helper», Bundle ID **explícito**
+   `dev.marmota.music.helper`; en la pestaña **App Services** marca
+   **MusicKit** y regístralo.
+2. Necesitas un certificado **Apple Development** (o **Developer ID
+   Application**) de ese equipo en el llavero. Si no lo tienes: Xcode →
+   *Settings* → *Accounts* → tu cuenta → *Manage Certificates* → **+**.
+3. Configura la clave (pasos de arriba, para que el instalador sepa tu Team
+   ID) y vuelve a ejecutar `./install-mac.sh`: firma el ayudante con el
+   certificado de tu Team ID. Con otro certificado:
+   `MARMOTA_SIGN_IDENTITY="Apple Development: …" ./install-mac.sh`; con otro
+   Bundle ID: `MARMOTA_HELPER_ID=…`.
+4. `marmota-music setup apple` pide a macOS el acceso a Apple Music (o lo pide
+   la primera canción). Se puede cambiar en *Ajustes del Sistema →
+   Privacidad y seguridad → Archivos multimedia y Apple Music*.
+
+`marmota-music apple-test` muestra si el ayudante está instalado, el permiso
+y si la suscripción puede reproducir el catálogo.
+
+Si algo falla (sin ayudante, sin permiso, sin suscripción, App ID sin
+MusicKit, macOS 13 o anterior, Linux y Windows), la canción suena buscando la
+misma en YouTube Music, como antes, y la línea de estado dice por qué.
+
+- **Volumen:** MusicKit no tiene volumen propio en el Mac; manda el del
+  sistema.
+- **Letra:** la misma cadena de siempre (LRCLIB → NetEase), sincronizada con
+  la posición real de Apple Music. La API pública de Apple Music no documenta
+  ningún endpoint de letras, así que el notch no las pide a Apple (tampoco usa
+  el token del reproductor web de music.apple.com). Para ver qué responde Apple
+  con tus claves: `marmota-music apple-test lyrics <id de catálogo>`.
+- **Vídeo:** los videoclips de Apple Music llevan FairPlay y no se pueden
+  pintar en el notch. Con el modo vídeo se muestra el videoclip de YouTube de
+  la canción **sin sonido**, y cada 2 s se vuelve a alinear con la posición de
+  Apple Music si se desvía más de 0,3 s. Si el clip tiene intro, la imagen
+  puede no coincidir con la del vídeo original.
+- **Radio:** cuando la cola se acaba, la radio sale de YouTube Music a partir
+  de la canción gemela.
 
 ## Limitaciones conocidas
 
 - **Spotify**: el vídeo y la radio automática vienen de YouTube Music.
-- **Apple Music**: por ahora solo búsqueda; sus canciones suenan desde YouTube Music. La reproducción con MusicKit (solo macOS) es el siguiente paso.
+- **Apple Music**: la reproducción con tu suscripción es solo para macOS 14+ con el ayudante firmado; en Linux, Windows o sin ayudante suena desde YouTube Music. Sin volumen propio ni letras de Apple (ver [Apple Music](#apple-music)).
 - **macOS**: el vidrio no difumina lo que hay detrás (como en Hyprland, se
   pinta con opacidad propia y la portada desenfocada).
 - **Blur de fondo**: Hyprland 0.56 no aplica `layer_rule` con `blur` en esta

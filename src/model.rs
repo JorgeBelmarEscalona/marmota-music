@@ -5,6 +5,8 @@ pub enum Source {
     #[default]
     YouTube,
     Spotify,
+    /// MusicKit helper on macOS (`apple_music.rs`).
+    Apple,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

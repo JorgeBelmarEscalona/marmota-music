@@ -1194,6 +1194,7 @@ impl App {
         let source = match self.source {
             Source::YouTube => "YouTube Music",
             Source::Spotify => "Spotify",
+            Source::Apple => "Apple Music",
         };
         label(cr, source, l.spotify.x + l.spotify.w + 12.0, l.save.y + 10.0, 110.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
 
@@ -1541,10 +1542,23 @@ impl App {
                     )
                 }
             }
-            Account::Apple if self.apple_search => (
-                format!("Búsqueda conectada · {}", crate::apple_api::storefront().to_uppercase()),
-                "Busca en todo el catálogo de Apple Music; por ahora sus canciones suenan desde YouTube Music.".into(),
-            ),
+            Account::Apple if self.apple_search => {
+                let am = self.apple.snapshot();
+                let playback = if !am.available {
+                    if cfg!(target_os = "macos") {
+                        "Sin el ayudante de MusicKit (macOS 14 e install-mac.sh), sus canciones suenan desde YouTube Music."
+                    } else {
+                        "Busca en todo el catálogo; sus canciones suenan desde YouTube Music (reproducir con Apple Music es solo para macOS)."
+                    }
+                } else if !am.usable() {
+                    "Sin permiso o sin suscripción: sus canciones suenan desde YouTube Music. Revísalo con marmota-music setup apple."
+                } else if am.auth == "authorized" {
+                    "Reproducción con tu suscripción de Apple Music lista."
+                } else {
+                    "Sus canciones suenan con tu suscripción; macOS pedirá permiso con la primera."
+                };
+                (format!("Búsqueda conectada · {}", crate::apple_api::storefront().to_uppercase()), playback.into())
+            }
             Account::Apple => (
                 "Sin conectar".into(),
                 "Con una cuenta de Apple Developer: crea un Media ID con MusicKit y una clave Media \

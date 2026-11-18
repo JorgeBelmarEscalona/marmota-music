@@ -1,4 +1,5 @@
 mod apple_api;
+mod apple_music;
 mod db;
 mod draw;
 mod login;
@@ -76,6 +77,10 @@ enum Action {
     /// Show the YouTube account the saved session belongs to (diagnostics).
     #[command(hide = true)]
     AccountTest,
+    /// Apple Music diagnostics: `apple-test` (helper and permission) or
+    /// `apple-test lyrics <id>` (what Apple answers for a song's lyrics).
+    #[command(hide = true)]
+    AppleTest { what: Option<String>, id: Option<String> },
     /// Open the search tab, optionally running a query.
     Search { query: Option<String> },
 }
@@ -213,11 +218,45 @@ fn main() {
                 println!("{:?} {:8} vid={} q={} | {} — {}", rank::debug_key(&query, t), t.source, t.video, t.quality, t.title, t.artist);
             }
         }
+        Action::AppleTest { what, id } => apple_test(what.as_deref(), id.as_deref()),
         Action::Lyrics { title, artist, duration } => {
             let t = model::Track { title, artist, duration, ..Default::default() };
             match lyrics::fetch(&t) {
                 Ok(l) => println!("{} · {} líneas", if l.synced { "SINCRONIZADA" } else { "solo texto" }, l.lines.len()),
                 Err(e) => println!("sin letra: {e}"),
+            }
+        }
+    }
+}
+
+fn apple_test(what: Option<&str>, id: Option<&str>) {
+    println!("clave MusicKit: {}", if apple_api::configured() { "configurada" } else { "no configurada" });
+    println!("país: {}", apple_api::storefront());
+    match apple_music::helper_path() {
+        Some(p) => println!("ayudante: {}", p.display()),
+        None => println!("ayudante: no instalado (las canciones suenan desde YouTube Music)"),
+    }
+    match what {
+        Some("lyrics") => {
+            let Some(id) = id else {
+                println!("uso: marmota-music apple-test lyrics <id de catálogo>");
+                return;
+            };
+            match apple_api::probe_lyrics(id) {
+                Ok((status, body)) => println!("letra con el developer token: HTTP {status} {body}"),
+                Err(e) => println!("letra con el developer token: {e}"),
+            }
+            #[cfg(target_os = "macos")]
+            match apple_music::probe_lyrics(id.trim_start_matches("am_")) {
+                Some(line) => println!("letra con MusicKit: {line}"),
+                None => println!("letra con MusicKit: el ayudante no respondió"),
+            }
+        }
+        _ => {
+            #[cfg(target_os = "macos")]
+            match apple_music::authorize() {
+                Some(line) => println!("{line}"),
+                None => println!("el ayudante no respondió"),
             }
         }
     }

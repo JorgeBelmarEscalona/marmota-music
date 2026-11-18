@@ -2,8 +2,9 @@
 //! an Apple Developer account: the key file (.p8), its Key ID and the Team
 //! ID sign a developer token (ES256 JWT) that no user sign-in is needed for.
 //!
-//! Songs found here play from YouTube Music, like Spotify songs without a
-//! Spotify device; playing them through Apple Music itself is a later step.
+//! On macOS 14+ the songs found here play with the user's subscription
+//! through the MusicKit helper (`apple_music.rs`); elsewhere they play from
+//! their YouTube Music twin, like Spotify songs without a Spotify device.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -150,6 +151,19 @@ pub fn search(query: &str) -> Result<Vec<Track>> {
         });
     }
     Ok(out)
+}
+
+/// Diagnostics only: what Apple answers for a song's lyrics with the
+/// developer token. The endpoint is not in Apple's public API reference, so
+/// the notch never uses it; lyrics come from LRCLIB / NetEase.
+pub fn probe_lyrics(id: &str) -> Result<(u16, String)> {
+    let tok = token()?;
+    let c = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let url = format!("https://api.music.apple.com/v1/catalog/{}/songs/{}/lyrics", storefront(), id.trim_start_matches("am_"));
+    let resp = c.get(url).bearer_auth(&tok).send()?;
+    let status = resp.status().as_u16();
+    let body: String = resp.text().unwrap_or_default().chars().take(300).collect();
+    Ok((status, body))
 }
 
 #[cfg(test)]
