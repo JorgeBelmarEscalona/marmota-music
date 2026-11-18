@@ -324,6 +324,104 @@ fn spotify() {
     spotify_playback();
 }
 
+/// A path typed or dragged into the terminal: quotes and `\ ` escapes off.
+fn clean_path(s: &str) -> PathBuf {
+    let t = s.trim().trim_matches(|c| c == '\'' || c == '"');
+    let home = dirs::home_dir().unwrap_or_default();
+    let t = t.replace("\\ ", " ");
+    match t.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(t),
+    }
+}
+
+/// Apple Music catalog search with a MusicKit key from Apple Developer.
+pub fn apple() {
+    println!("  {D}Busca en todo el catálogo de Apple Music; requiere una cuenta de Apple Developer.{X}");
+    if crate::apple_api::configured() {
+        ok(&format!("La búsqueda en Apple Music ya está conectada (país: {})", crate::apple_api::storefront()));
+        if !yes("  ¿Cambiar la clave?", false) {
+            return;
+        }
+    } else if !yes("  ¿Tienes una cuenta de Apple Developer?", false) {
+        println!("  {D}Sin problema: puedes conectarla después desde la Biblioteca.{X}");
+        return;
+    }
+    println!("  La búsqueda usa una clave MusicKit de tu cuenta (se abre ahora el portal):");
+    println!("    1. {B}Identifiers{X} → {B}+{X} → {B}Media IDs{X}: descripción «Marmota Music»,");
+    println!("       identificador {B}media.dev.marmota.music{X}, marca {B}MusicKit{X} y regístralo.");
+    println!("    2. {B}Keys{X} → {B}+{X}: nombre «Marmota Music», marca {B}Media Services{X}, pulsa");
+    println!("       {B}Configure{X}, elige el Media ID del paso 1 y registra la clave.");
+    println!("    3. Descarga el archivo {B}AuthKey_XXXXXXXXXX.p8{X} (solo se puede una vez) y anota");
+    println!("       el {B}Key ID{X}. El {B}Team ID{X} está en {B}Membership details{X}.");
+    println!("  {D}La clave se guarda solo en este equipo; no la compartas con nadie.{X}");
+    open_url("https://developer.apple.com/account/resources/authkeys/list");
+    loop {
+        let team = ask("  Team ID:").to_ascii_uppercase();
+        if team.is_empty() {
+            println!("  {D}Omitido; puedes hacerlo después.{X}");
+            return;
+        }
+        let key_id = ask("  Key ID:").to_ascii_uppercase();
+        let file = clean_path(&ask("  Archivo .p8 (puedes arrastrarlo a esta ventana):"));
+        let pem = match std::fs::read_to_string(&file) {
+            Ok(p) if p.contains("PRIVATE KEY") => p,
+            _ => {
+                bad(&format!("No pude leer una clave en {}", file.display()));
+                if yes("  ¿Probar de nuevo?", true) {
+                    continue;
+                }
+                return;
+            }
+        };
+        // Keep a private copy next to the library: the download folder
+        // gets cleaned up.
+        let dest = paths::data_dir().join("apple-musickit.p8");
+        if let Err(e) = save_private(&dest, &pem) {
+            bad(&format!("No pude guardar la clave: {e}"));
+            return;
+        }
+        let guess = crate::apple_api::storefront();
+        let sf = ask(&format!("  País de tu cuenta de Apple Music (2 letras) {D}[{guess}]{X}:")).to_ascii_lowercase();
+        let sf = if sf.len() == 2 { sf } else { guess };
+        paths::set_config("apple_team_id", team.into());
+        paths::set_config("apple_key_id", key_id.into());
+        paths::set_config("apple_key_file", dest.display().to_string().into());
+        paths::set_config("apple_storefront", sf.into());
+        crate::apple_api::reset();
+        match crate::apple_api::search("Bohemian Rhapsody") {
+            Ok(t) if !t.is_empty() => {
+                ok("Búsqueda en Apple Music conectada");
+                println!("  {D}Sus canciones suenan desde YouTube Music por ahora.{X}");
+                return;
+            }
+            Ok(_) => bad("Apple Music respondió sin resultados (¿el país es correcto?)"),
+            Err(e) => bad(&format!("{e}")),
+        }
+        if !yes("  ¿Probar de nuevo?", true) {
+            for k in ["apple_team_id", "apple_key_id", "apple_key_file"] {
+                paths::set_config(k, "".into());
+            }
+            let _ = std::fs::remove_file(&dest);
+            return;
+        }
+    }
+}
+
+/// Write a secret readable by this user only.
+fn save_private(path: &std::path::Path, text: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::File::create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(text.as_bytes())
+}
+
 /// Keyboard shortcut that opens the notch on this platform.
 pub fn shortcut() -> String {
     #[cfg(windows)]
@@ -346,25 +444,40 @@ pub fn run(only: Option<&str>) {
             youtube();
             return;
         }
+        Some("apple") => {
+            println!("\n{A}{B}♪ Marmota Music{X} — Apple Music");
+            apple();
+            notify_notch();
+            if std::env::var_os("MM_SETUP_WAIT").is_some() {
+                ask(&format!("\n  {D}Pulsa Enter para cerrar{X}"));
+            }
+            return;
+        }
         _ => {}
     }
     println!("\n{A}{B}♪ Marmota Music{X} — conectemos tus cuentas");
     println!("{D}  Responde s/n (Enter elige la opción en mayúscula). Repítelo cuando quieras con «marmota-music setup».{X}");
     youtube();
     spotify();
+    step(3, "Apple Music");
+    apple();
     paths::set_config("setup_done", true.into());
-    step(3, "Listo");
+    step(4, "Listo");
     println!("  Abre el reproductor con {B}{}{X}.", shortcut());
-    // Tell a running notch to pick up the new lists.
+    notify_notch();
+    if std::env::var_os("MM_SETUP_WAIT").is_some() {
+        ask(&format!("\n  {D}Pulsa Enter para cerrar{X}"));
+    }
+}
+
+/// Tell a running notch to pick up new lists and keys.
+fn notify_notch() {
     let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
     let _ = Command::new(exe)
         .arg("refresh")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    if std::env::var_os("MM_SETUP_WAIT").is_some() {
-        ask(&format!("\n  {D}Pulsa Enter para cerrar{X}"));
-    }
 }
 
 /// Is a YouTube account connected? Existing installs that already picked a

@@ -17,7 +17,7 @@ use crate::mpv::{self, Mpv};
 use crate::paths;
 use crate::spotify::{self, Cmd as SpotifyCmd, Spotify};
 use crate::theme::{self, Rgb};
-use crate::{rank, spotify_api, yt, ytm};
+use crate::{apple_api, rank, spotify_api, yt, ytm};
 
 pub const COLLAPSED_W: f64 = 664.0;
 pub const COLLAPSED_H: f64 = 74.0;
@@ -85,6 +85,11 @@ pub enum RowItem {
     /// spotifyd needs sudo and its own sign-in: the terminal assistant.
     #[cfg_attr(windows, allow(dead_code))]
     SpotifyPlayback,
+    /// Open the Apple Developer keys page.
+    AppleDeveloper,
+    /// Enter the MusicKit key in the terminal assistant.
+    AppleSetup,
+    AppleForget,
     Back,
     DetailPlay,
     DetailShuffle,
@@ -196,6 +201,7 @@ impl RowItem {
 pub enum Account {
     YouTube,
     Spotify,
+    Apple,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -275,6 +281,8 @@ pub struct App {
     pub sp_was_playing: bool,
     pub sp_confirmed: bool,
     pub spotify_search: bool,
+    /// Apple Music catalog search has a MusicKit key.
+    pub apple_search: bool,
     pub accounts_ok: bool,
     /// Browser whose YouTube session is in use, when detected.
     pub yt_browser: Option<&'static str>,
@@ -698,6 +706,7 @@ fn build(
         sp_was_playing: false,
         sp_confirmed: false,
         spotify_search: spotify_api::configured(),
+        apple_search: apple_api::configured(),
         accounts_ok: crate::setup::accounts_configured(),
         yt_browser: crate::setup::connected_browser(),
         playing: false,
@@ -1319,6 +1328,16 @@ impl App {
                 }
                 #[cfg(target_os = "linux")]
                 button(&mut out, &mut y, &[RowItem::SpotifyPlayback]);
+                y += 6.0;
+
+                header(&mut out, &mut y, "APPLE MUSIC");
+                out.push((Rect::new(x, y, w, 58.0), RowItem::AccountInfo(Account::Apple)));
+                y += 64.0;
+                if self.apple_search {
+                    button(&mut out, &mut y, &[RowItem::AppleSetup, RowItem::AppleForget]);
+                } else {
+                    button(&mut out, &mut y, &[RowItem::AppleDeveloper, RowItem::AppleSetup]);
+                }
                 let _ = y;
             }
             Tab::Library => {
@@ -1856,10 +1875,28 @@ impl App {
                 paths::set_config("spotify_client_id", "".into());
                 paths::set_config("spotify_client_secret", "".into());
                 self.spotify_search = spotify_api::configured();
+                self.apple_search = apple_api::configured();
                 self.searched.clear();
                 self.set_status("Claves de Spotify quitadas");
             }
-            RowItem::SpotifyPlayback => self.open_setup(),
+            RowItem::SpotifyPlayback => self.open_setup(None),
+            RowItem::AppleDeveloper => {
+                crate::setup::open_url("https://developer.apple.com/account/resources/authkeys/list");
+                self.set_status("Crea un Media ID con MusicKit y una clave Media Services; descarga el .p8");
+            }
+            RowItem::AppleSetup => self.open_setup(Some("apple")),
+            RowItem::AppleForget => {
+                if let Some(k) = apple_api::keys() {
+                    let _ = std::fs::remove_file(&k.key_file);
+                }
+                for k in ["apple_team_id", "apple_key_id", "apple_key_file"] {
+                    paths::set_config(k, "".into());
+                }
+                apple_api::reset();
+                self.apple_search = apple_api::configured();
+                self.searched.clear();
+                self.set_status("Clave de Apple Music quitada");
+            }
             RowItem::AccountInfo(_) => {}
             RowItem::Back => self.close_detail(),
             RowItem::DetailPlay | RowItem::DetailShuffle => {
@@ -2215,7 +2252,7 @@ impl App {
         self.radio_loading = true;
         let tx = self.tx.clone();
         let seed = seed.to_string();
-        let spotify_track = self.queue.iter().find(|t| t.id == seed && t.is_spotify()).cloned();
+        let spotify_track = self.queue.iter().find(|t| t.id == seed && (t.is_spotify() || t.is_apple())).cloned();
         std::thread::spawn(move || {
             // The radio comes from YouTube Music; a Spotify song needs its
             // YouTube twin as the seed.
@@ -2230,13 +2267,14 @@ impl App {
     }
 
     fn begin_track(&mut self, t: Track) {
-        if t.is_spotify() {
+        if t.is_spotify() || t.is_apple() {
             let sp = self.spotify.snapshot();
-            if sp.available || sp.standby {
+            if t.is_spotify() && (sp.available || sp.standby) {
                 self.start_spotify(t);
                 return;
             }
-            // No Spotify device running: play the same song from YouTube Music.
+            // No Spotify device running, or an Apple Music song: play the
+            // same song from YouTube Music.
             self.resolving = true;
             let tx = self.tx.clone();
             std::thread::spawn(move || {
@@ -2488,6 +2526,7 @@ impl App {
         self.login_browser = crate::login::browser().map(|(name, _)| name);
         self.sync_accounts();
         self.spotify_search = spotify_api::configured();
+                self.apple_search = apple_api::configured();
         self.dirty = true;
     }
 
@@ -2605,12 +2644,21 @@ impl App {
         self.searching = true;
         self.dirty = true;
         self.spotify_search = spotify_api::configured();
+                self.apple_search = apple_api::configured();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let sq = q.clone();
             let spotify = std::thread::spawn(move || {
                 if spotify_api::configured() {
                     spotify_api::search(&sq)
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+            let aq = q.clone();
+            let apple = std::thread::spawn(move || {
+                if apple_api::configured() {
+                    apple_api::search(&aq)
                 } else {
                     Ok(Vec::new())
                 }
@@ -2628,7 +2676,15 @@ impl App {
                 }
                 Err(_) => Vec::new(),
             };
-            let tracks = rank::merge(&q, yt_tracks, sp_tracks);
+            let am_tracks = match apple.join() {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Event::Error(format!("Apple Music: {e}")));
+                    Vec::new()
+                }
+                Err(_) => Vec::new(),
+            };
+            let tracks = rank::merge(&q, vec![yt_tracks, sp_tracks, am_tracks]);
             let _ = tx.send(Event::SearchDone(q, tracks, colls));
         });
     }
@@ -2762,12 +2818,13 @@ impl App {
 
     /// Run `marmota-music setup` in a new console window.
     #[cfg(windows)]
-    fn open_setup(&mut self) {
+    fn open_setup(&mut self, only: Option<&str>) {
         let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
         let spawned = std::process::Command::new("cmd")
             .args(["/C", "start", "Marmota Music"])
             .arg(exe)
             .arg("setup")
+            .args(only)
             .env("MM_SETUP_WAIT", "1")
             .spawn();
         match spawned {
@@ -2781,9 +2838,13 @@ impl App {
 
     /// Run `marmota-music setup` in a Terminal.app window.
     #[cfg(target_os = "macos")]
-    fn open_setup(&mut self) {
+    fn open_setup(&mut self, only: Option<&str>) {
         let exe = std::env::current_exe().unwrap_or_else(|_| "marmota-music".into());
-        let cmd = format!("MM_SETUP_WAIT=1 {} setup", crate::mac::sh_quote(&exe.display().to_string()));
+        let cmd = format!(
+            "MM_SETUP_WAIT=1 {} setup {}",
+            crate::mac::sh_quote(&exe.display().to_string()),
+            only.unwrap_or("")
+        );
         match crate::mac::open_terminal(&cmd) {
             Ok(()) => {
                 self.set_status("Sigue los pasos en la Terminal");
@@ -2795,7 +2856,7 @@ impl App {
 
     /// Run `marmota-music setup` in a floating terminal.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn open_setup(&mut self) {
+    fn open_setup(&mut self, only: Option<&str>) {
         let omarchy = "omarchy-launch-floating-terminal-with-presentation";
         let has_omarchy = std::process::Command::new("sh")
             .args(["-c", &format!("command -v {omarchy}")])
@@ -2803,10 +2864,13 @@ impl App {
             .status()
             .is_ok_and(|s| s.success());
         let spawned = if has_omarchy {
-            std::process::Command::new(omarchy).arg("marmota-music setup").spawn()
+            std::process::Command::new(omarchy)
+                .arg(format!("marmota-music setup {}", only.unwrap_or("")))
+                .spawn()
         } else {
             std::process::Command::new("xdg-terminal-exec")
                 .args(["marmota-music", "setup"])
+                .args(only)
                 .env("MM_SETUP_WAIT", "1")
                 .spawn()
         };
@@ -3013,6 +3077,7 @@ impl App {
             Event::SpotifyChecked(result) => {
                 self.checking_spotify = false;
                 self.spotify_search = spotify_api::configured();
+                self.apple_search = apple_api::configured();
                 self.searched.clear();
                 match result {
                     Ok(n) if n > 0 => self.set_status("Búsqueda en Spotify conectada"),
@@ -3112,6 +3177,7 @@ impl App {
             Cmd::Refresh => {
                 self.refresh_library();
                 self.spotify_search = spotify_api::configured();
+                self.apple_search = apple_api::configured();
                 self.searched.clear();
                 self.set_status("Cuentas actualizadas");
             }

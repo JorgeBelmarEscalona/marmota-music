@@ -20,6 +20,9 @@ dirs = "7"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 sha1_smol = "1"
+# Apple Music developer token (ES256 JWT signed with the MusicKit key).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
+base64 = "0.22"
 tungstenite ={ version = "0.24", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

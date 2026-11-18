@@ -3,7 +3,7 @@
 Reproductor de música nativo para Omarchy/Hyprland, macOS y Windows: una barra flotante tipo
 *notch* en la parte inferior de la pantalla, con estética de vidrio, portada,
 letras sincronizadas, vídeo dentro del notch y controles completos.
-Busca y reproduce desde **YouTube Music** y **Spotify**.
+Busca y reproduce desde **YouTube Music** y **Spotify**, y busca también en **Apple Music**.
 
 ![Vídeo y letra sincronizada](docs/video-letra.png)
 ![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
@@ -45,6 +45,7 @@ altura lógica: 1040×612 en una pantalla 1440p, 832×490 en el panel del portá
 | Dibujo | Cairo + Pango, todo pintado a mano (vidrio, iconos, texto) |
 | Audio y vídeo | libmpv embebido (render por software al notch) con IPC JSON por socket |
 | Búsqueda / inicio / álbumes / listas / radio | API InnerTube de YouTube Music (`src/ytm.rs`); yt-dlp como respaldo y para listas privadas |
+| Búsqueda en Spotify / Apple Music | Spotify Web API (`src/spotify_api.rs`); Apple Music API con un token ES256 firmado con tu clave MusicKit (`src/apple_api.rs`) |
 | Letras | LRCLIB (exacta y búsqueda) y NetEase de respaldo; solo se cachean las sincronizadas |
 | Portadas | descargadas y cacheadas en `~/.cache/marmota-music/art/` |
 | Biblioteca / listas | SQLite (`~/.local/share/marmota-music/marmota-music.db`) |
@@ -200,6 +201,10 @@ Cuentas**.
 - **Spotify (reproducción con Premium, solo Linux):** instalar `spotifyd`
   necesita `sudo`, así que ese paso abre el asistente en una terminal.
 
+- **Apple Music (búsqueda):** *Crear clave en Apple Developer* abre el
+  portal y *Configurar clave* abre el asistente en una terminal (ver
+  [Apple Music](#apple-music)).
+
 El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
 
 - **YouTube Music:** ¿tienes cuenta? → elige el navegador donde tienes la
@@ -207,6 +212,9 @@ El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
 - **Spotify:** ¿tienes cuenta? → abre la página para crear la app de
   búsqueda y valida las claves → si es Premium, instala `spotifyd`, abre el
   inicio de sesión y lo deja arrancando solo.
+- **Apple Music:** ¿tienes Apple Developer? → Team ID, Key ID, archivo
+  `.p8` y país → prueba una búsqueda (`marmota-music setup apple` para solo
+  este paso).
 
 Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
 Para repetirlo: `marmota-music setup` (o el instalador con `--setup` / `-Setup`).
@@ -277,10 +285,42 @@ canción → artista → si tiene vídeo → calidad de audio. Cada fila muestra
 Sin `spotifyd`, una canción de Spotify se reproduce igual: se busca la misma
 canción en YouTube Music.
 
+## Apple Music
+
+Busca en todo el catálogo de Apple Music junto con YouTube Music y Spotify.
+Las filas de Apple Music llevan su ícono rojo y siguen el mismo orden
+(título → artista → vídeo → calidad). Funciona en Linux, macOS y Windows.
+
+Hace falta una cuenta de [Apple Developer](https://developer.apple.com/account)
+(de pago), porque la API firma cada consulta con una clave MusicKit tuya:
+
+1. *Certificates, IDs & Profiles* → **Identifiers** → **+** → **Media IDs**:
+   descripción «Marmota Music», identificador `media.dev.marmota.music`,
+   marca **MusicKit** y regístralo.
+2. **Keys** → **+**: nombre «Marmota Music», marca **Media Services**, pulsa
+   **Configure**, elige el Media ID anterior y registra la clave.
+3. Descarga `AuthKey_XXXXXXXXXX.p8` (Apple deja descargarlo **una sola
+   vez**) y anota el **Key ID**. El **Team ID** está en *Membership details*.
+4. En el notch: **Biblioteca → Cuentas → Apple Music → Configurar clave**,
+   o en una terminal `marmota-music setup apple`. Te pide el Team ID, el
+   Key ID, el archivo `.p8` (puedes arrastrarlo a la ventana) y el país de
+   tu cuenta, y prueba una búsqueda.
+
+La clave se copia a la carpeta de datos (`apple-musickit.p8`, solo legible
+por tu usuario) y el config guarda `apple_team_id`, `apple_key_id`,
+`apple_key_file` y `apple_storefront`. No la subas a ningún repositorio:
+con ella cualquiera puede usar la API a tu nombre. *Quitar clave* en
+Cuentas la borra.
+
+Por ahora una canción de Apple Music se reproduce buscando la misma
+canción en YouTube Music (igual que Spotify sin `spotifyd`), con letras,
+vídeo y radio. Reproducirla con tu suscripción de Apple Music necesita
+MusicKit (Swift) y llegará en una segunda fase, solo para macOS.
+
 ## Limitaciones conocidas
 
 - **Spotify**: el vídeo y la radio automática vienen de YouTube Music.
-- **Apple Music**: descartado (no hay reproducción viable en Linux).
+- **Apple Music**: por ahora solo búsqueda; sus canciones suenan desde YouTube Music. La reproducción con MusicKit (solo macOS) es el siguiente paso.
 - **macOS**: el vidrio no difumina lo que hay detrás (como en Hyprland, se
   pinta con opacidad propia y la portada desenfocada).
 - **Blur de fondo**: Hyprland 0.56 no aplica `layer_rule` con `blur` en esta

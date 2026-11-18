@@ -1,4 +1,4 @@
-//! Order mixed YouTube Music + Spotify results the way the user asked:
+//! Order mixed YouTube Music, Spotify and Apple Music results the way the user asked:
 //! song title match first, then artist, then whether it has a video, then
 //! audio quality. The source's own relevance order breaks the remaining ties.
 
@@ -104,15 +104,12 @@ fn key(t: &Track, q: &[String]) -> (u8, u8, u8, u8) {
     (title, artist, t.video as u8, t.quality)
 }
 
-/// Merge both sources and sort. Each list is already in its own relevance
+/// Merge every source and sort. Each list is already in its own relevance
 /// order, which is kept as the final tiebreaker.
-pub fn merge(query: &str, youtube: Vec<Track>, spotify: Vec<Track>) -> Vec<Track> {
+pub fn merge(query: &str, sources: Vec<Vec<Track>>) -> Vec<Track> {
     let q = tokens(query);
-    let mut all: Vec<(usize, Track)> = youtube
-        .into_iter()
-        .enumerate()
-        .chain(spotify.into_iter().enumerate())
-        .collect();
+    let mut all: Vec<(usize, Track)> =
+        sources.into_iter().flat_map(|list| list.into_iter().enumerate()).collect();
     all.sort_by(|(ia, a), (ib, b)| key(b, &q).cmp(&key(a, &q)).then(ia.cmp(ib)));
     all.into_iter().map(|(_, t)| t).collect()
 }

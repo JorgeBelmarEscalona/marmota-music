@@ -18,7 +18,7 @@ pub struct Track {
     pub source: String,
     /// The stream itself is a music video (not just a cover).
     pub video: bool,
-    /// Rough audio quality: 3 Spotify (320 kbps), 2 YouTube Music song or
+    /// Rough audio quality: 3 Spotify (320 kbps) or Apple Music, 2 YouTube Music song or
     /// official video, 1 user upload.
     pub quality: u8,
 }
@@ -28,9 +28,18 @@ impl Track {
         self.source == "spotify"
     }
 
+    pub fn is_apple(&self) -> bool {
+        self.source == "apple"
+    }
+
     pub fn url(&self) -> String {
         match self.source.as_str() {
             "spotify" => format!("spotify:track:{}", self.id.trim_start_matches("sp_")),
+            "apple" => format!(
+                "https://music.apple.com/{}/song/{}",
+                crate::apple_api::storefront(),
+                self.id.trim_start_matches("am_")
+            ),
             "local" => self.id.clone(),
             _ => format!("https://music.youtube.com/watch?v={}", self.id),
         }

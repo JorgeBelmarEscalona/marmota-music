@@ -431,11 +431,36 @@ fn icon(cr: &Context, kind: Icon, cx: f64, cy: f64, s: f64, color: Rgb, alpha: f
 
 /// Tiny platform mark: YouTube Music (red disc, ring and play) or Spotify
 /// (green disc with three waves).
-fn platform_badge(cr: &Context, cx: f64, cy: f64, spotify: bool, video: bool, a: f64) {
+fn platform_badge(cr: &Context, cx: f64, cy: f64, source: &str, video: bool, a: f64) {
     let r = 8.0;
     let _ = cr.save();
     cr.arc(cx, cy, r, 0.0, std::f64::consts::TAU);
-    if spotify {
+    if source == "apple" {
+        // Apple Music: red-pink disc with a white beamed note.
+        cr.set_source_rgba(0.98, 0.14, 0.24, 0.92 * a);
+        cr.fill();
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95 * a);
+        let (lx, rx) = (cx - r * 0.30, cx + r * 0.30);
+        let (top, low) = (cy - r * 0.50, cy + r * 0.30);
+        for x in [lx, rx] {
+            let _ = cr.save();
+            cr.translate(x - r * 0.13, low);
+            cr.scale(1.25, 1.0);
+            cr.arc(0.0, 0.0, r * 0.16, 0.0, std::f64::consts::TAU);
+            let _ = cr.restore();
+            cr.fill();
+        }
+        cr.set_line_width(1.2);
+        cr.move_to(lx + r * 0.05, low);
+        cr.line_to(lx + r * 0.05, top + r * 0.12);
+        cr.move_to(rx + r * 0.05, low);
+        cr.line_to(rx + r * 0.05, top);
+        cr.stroke();
+        cr.set_line_width(1.8);
+        cr.move_to(lx + r * 0.05, top + r * 0.12);
+        cr.line_to(rx + r * 0.05, top);
+        cr.stroke();
+    } else if source == "spotify" {
         cr.set_source_rgba(0.12, 0.84, 0.38, 0.92 * a);
         cr.fill();
         cr.set_source_rgba(0.04, 0.04, 0.04, 0.95 * a);
@@ -1516,6 +1541,16 @@ impl App {
                     )
                 }
             }
+            Account::Apple if self.apple_search => (
+                format!("Búsqueda conectada · {}", crate::apple_api::storefront().to_uppercase()),
+                "Busca en todo el catálogo de Apple Music; por ahora sus canciones suenan desde YouTube Music.".into(),
+            ),
+            Account::Apple => (
+                "Sin conectar".into(),
+                "Con una cuenta de Apple Developer: crea un Media ID con MusicKit y una clave Media \
+                 Services, descarga el .p8 y configúralo en la terminal."
+                    .into(),
+            ),
         }
     }
 
@@ -1711,6 +1746,14 @@ impl App {
                     self.pill(cr, *r, Icon::Plus, text, hovered, false, a);
                 }
                 RowItem::SpotifyForget => self.pill(cr, *r, Icon::Close, "Quitar claves", hovered, false, a),
+                RowItem::AppleDeveloper => {
+                    self.pill(cr, *r, Icon::Music, "1 · Crear clave en Apple Developer", hovered, false, a)
+                }
+                RowItem::AppleSetup => {
+                    let text = if self.apple_search { "Cambiar clave" } else { "2 · Configurar clave (terminal)" };
+                    self.pill(cr, *r, Icon::Plus, text, hovered, false, a);
+                }
+                RowItem::AppleForget => self.pill(cr, *r, Icon::Close, "Quitar clave", hovered, false, a),
                 RowItem::SpotifyPlayback => self.pill(
                     cr,
                     *r,
@@ -1828,7 +1871,7 @@ impl App {
             format!("{} · {}", t.subtitle(), t.album)
         };
         label(cr, &sub, text_x, r.y + 25.0, text_w, 10.5, pango::Weight::Normal, theme::MUTED, 0.62 * a);
-        platform_badge(cr, r.x + r.w - 20.0, r.cy(), t.is_spotify(), t.video, a);
+        platform_badge(cr, r.x + r.w - 20.0, r.cy(), &t.source, t.video, a);
         if t.duration > 0.0 && !hovered {
             label(cr, &format_time(t.duration), r.x + r.w - 80.0, r.y + 15.0, 44.0, 10.0, pango::Weight::Normal, theme::DIM, 0.7 * a);
         }

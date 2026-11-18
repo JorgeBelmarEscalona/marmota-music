@@ -1,3 +1,4 @@
+mod apple_api;
 mod db;
 mod draw;
 mod login;
@@ -200,7 +201,15 @@ fn main() {
         Action::SearchTest { query } => {
             let yt = ytm::search(&query).map(|r| r.0).unwrap_or_default();
             let sp = spotify_api::search(&query).unwrap_or_default();
-            for t in rank::merge(&query, yt, sp).iter().take(12) {
+            let am = match apple_api::search(&query) {
+                Ok(t) => t,
+                Err(e) if apple_api::configured() => {
+                    println!("apple music: {e}");
+                    Vec::new()
+                }
+                Err(_) => Vec::new(),
+            };
+            for t in rank::merge(&query, vec![yt, sp, am]).iter().take(12) {
                 println!("{:?} {:8} vid={} q={} | {} — {}", rank::debug_key(&query, t), t.source, t.video, t.quality, t.title, t.artist);
             }
         }
