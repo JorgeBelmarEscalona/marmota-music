@@ -266,7 +266,7 @@ final class Bridge {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let bridge = Bridge()
+let bridge = MainActor.assumeIsolated { Bridge() }
 
 if CommandLine.arguments.contains("--authorize") {
     Task { @MainActor in
