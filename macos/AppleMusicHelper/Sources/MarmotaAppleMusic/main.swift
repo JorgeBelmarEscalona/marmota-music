@@ -23,13 +23,15 @@ import Combine
 import Foundation
 import MusicKit
 
+@MainActor
 final class Bridge {
     let player = ApplicationMusicPlayer.shared
     var currentID = ""
     var duration: Double = 0
     var interval: Double = 1.0
     var timer: Timer?
-    var watchers: [AnyCancellable] = []
+    var stateWatch: AnyCancellable?
+    var queueWatch: AnyCancellable?
     /// The song really started (so a later stop is its end, not a load).
     var started = false
     var userPaused = false
@@ -39,13 +41,18 @@ final class Bridge {
     var entryID: String?
 
     init() {
-        watchers.append(player.state.objectWillChange.sink { [weak self] _ in
-            // objectWillChange fires before the value changes.
-            DispatchQueue.main.async { self?.changed() }
-        })
-        watchers.append(player.queue.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.changed() }
-        })
+        // objectWillChange fires before the value changes: look afterwards.
+        stateWatch = player.state.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in self?.changed() }
+        }
+        watchQueue()
+    }
+
+    /// The queue is replaced with each song, so watch the new one.
+    func watchQueue() {
+        queueWatch = player.queue.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in self?.changed() }
+        }
     }
 
     // MARK: output
@@ -132,7 +139,7 @@ final class Bridge {
         timer = nil
         guard player.state.playbackStatus == .playing, interval > 0 else { return }
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            self?.emitState()
+            MainActor.assumeIsolated { self?.emitState() }
         }
         t.tolerance = interval * 0.2
         RunLoop.main.add(t, forMode: .common)
@@ -183,6 +190,7 @@ final class Bridge {
             guard currentID == id else { return }
             duration = song.duration ?? 0
             player.queue = ApplicationMusicPlayer.Queue(for: [song])
+            watchQueue()
             try await player.play()
             emitState()
         } catch {
