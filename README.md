@@ -9,14 +9,14 @@ Busca y reproduce desde **YouTube Music** y **Spotify**.
 ![Búsqueda en YouTube Music y Spotify](docs/buscar.png)
 
 - **Abrir/cerrar:** `Super + Shift + M` (en macOS `⌘ + ⇧ + M`, en Windows `Win + Alt + M`), o `marmota-music toggle`
-- **Instalar:** `./install.sh` (ver [Instalar](#instalar)); en macOS, `./install-mac.sh` (ver [macOS](#macos)); en Windows, `install.ps1` (ver [Windows](#windows))
+- **Instalar:** [Linux](#linux-omarchy--hyprland) `./install.sh` · [macOS](#macos) `./install-mac.sh` · [Windows](#windows) `install.ps1`
 - Hecho en Rust + GTK4, pensado para gastar poco: ~1 % de CPU contraído.
 
 ## Uso
 
 | Acción | Cómo |
 | --- | --- |
-| Abrir el notch | `Super + Shift + M` |
+| Abrir el notch | `Super + Shift + M` (macOS `⌘ + ⇧ + M`, Windows `Win + Alt + M`) |
 | Reproducir / pausar | clic en el botón central, o `Espacio` |
 | Adelantar / retroceder 5 s | `←` / `→` |
 | Volumen | arrastrar la barra, rueda del ratón, o `↑` / `↓` |
@@ -71,6 +71,18 @@ agrégalo como módulo con `"onClick": "marmota-music toggle"`.
 
 ## Instalar
 
+| | Linux (Omarchy / Hyprland) | macOS | Windows |
+| --- | --- | --- | --- |
+| Requisitos | Arch / Omarchy con `pacman` y `git` | macOS 11 o superior, [Homebrew](https://brew.sh) y `git` | Windows 10/11 con `winget` y `git` |
+| Instalador | `./install.sh` | `./install-mac.sh` | `install.ps1` |
+| Atajo | `Super + Shift + M` | `⌘ + ⇧ + M` | `Win + Alt + M` |
+| Queda en | `~/.local/bin/marmota-music` | `~/Applications/Marmota Music.app` | `%LOCALAPPDATA%\Programs\MarmotaMusic` |
+
+Para **actualizar**, en la carpeta del proyecto: `git pull` y vuelve a
+ejecutar el instalador. Lo que ya está configurado no se toca.
+
+### Linux (Omarchy / Hyprland)
+
 ```bash
 git clone https://github.com/JorgeBelmarEscalona/marmota-music
 cd marmota-music
@@ -87,6 +99,82 @@ El instalador:
 4. arranca el notch;
 5. **la primera vez** abre el asistente de cuentas. Si ya estaba configurado,
    lo omite.
+
+Para repetir el asistente: `./install.sh --setup`.
+
+### macOS
+
+1. Abre la Terminal (⌘ + Espacio → «Terminal»). Si no tienes
+   [Homebrew](https://brew.sh), instálalo:
+
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+   `git` viene con las *Command Line Tools* de Xcode: si macOS ofrece
+   instalarlas, acepta.
+
+2. Descarga e instala Marmota Music:
+
+   ```bash
+   git clone https://github.com/JorgeBelmarEscalona/marmota-music
+   cd marmota-music
+   ./install-mac.sh
+   ```
+
+3. Abre el notch con **`⌘ + ⇧ + M`**. No tiene icono en el Dock: aparece
+   sobre él.
+
+El instalador:
+
+1. instala con `brew` lo que falte (`gtk4`, `mpv`, `yt-dlp`, `pkgconf`,
+   `adwaita-icon-theme`, `rust`);
+2. compila y crea `~/Applications/Marmota Music.app` (sin icono en el Dock
+   ni barra de menús propia), firmada *ad hoc*, y el comando
+   `marmota-music` en `$(brew --prefix)/bin`;
+3. registra un LaunchAgent (`~/Library/LaunchAgents/dev.marmota.music.plist`)
+   para que arranque al iniciar sesión, y lo arranca;
+4. **la primera vez** abre el asistente de cuentas.
+
+Para repetir el asistente: `./install-mac.sh --setup`. Para desinstalar:
+
+```bash
+launchctl bootout gui/$(id -u)/dev.marmota.music
+rm -rf ~/Applications/Marmota\ Music.app ~/Library/LaunchAgents/dev.marmota.music.plist "$(brew --prefix)/bin/marmota-music"
+```
+
+### Windows
+
+1. Abre PowerShell. Si no tienes `git`, instálalo y abre una **nueva**
+   ventana de PowerShell:
+
+   ```powershell
+   winget install --id Git.Git -e
+   ```
+
+2. Descarga e instala Marmota Music:
+
+   ```powershell
+   git clone https://github.com/JorgeBelmarEscalona/marmota-music
+   cd marmota-music
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
+
+3. Abre el notch con **`Win + Alt + M`**.
+
+El instalador:
+
+1. instala [MSYS2](https://www.msys2.org) con `winget` si no está, y desde
+   ahí GTK4, libmpv y Rust (entorno UCRT64); `yt-dlp` también con `winget`;
+2. compila y deja el programa, con las DLL de GTK y mpv que necesita, en
+   `%LOCALAPPDATA%\Programs\MarmotaMusic\bin\marmota-music.exe` (agregado al
+   `PATH` del usuario);
+3. crea el arranque automático (carpeta *Inicio*) y un acceso en el menú
+   Inicio;
+4. arranca el notch y, **la primera vez**, abre el asistente de cuentas.
+
+Para repetir el asistente:
+`powershell -ExecutionPolicy Bypass -File install.ps1 -Setup`.
 
 ### Conectar cuentas
 
@@ -121,29 +209,12 @@ El asistente de terminal, `marmota-music setup`, hace lo mismo paso a paso:
   inicio de sesión y lo deja arrancando solo.
 
 Todo es opcional: sin cuentas se puede buscar y escuchar desde YouTube Music.
-Para repetirlo: `marmota-music setup` o `./install.sh --setup`.
+Para repetirlo: `marmota-music setup` (o el instalador con `--setup` / `-Setup`).
 
-## macOS
-
-```bash
-git clone https://github.com/JorgeBelmarEscalona/marmota-music
-cd marmota-music
-./install-mac.sh
-```
-
-Requiere [Homebrew](https://brew.sh). El instalador:
-
-1. instala con `brew` lo que falte (`gtk4`, `mpv`, `yt-dlp`, `pkgconf`,
-   `adwaita-icon-theme`, `rust`);
-2. compila y crea `~/Applications/Marmota Music.app` (sin icono en el Dock
-   ni barra de menús propia: `LSUIElement`), firmada *ad hoc*, y el comando
-   `marmota-music` en `$(brew --prefix)/bin`;
-3. registra un LaunchAgent (`~/Library/LaunchAgents/dev.marmota.music.plist`)
-   para que arranque al iniciar sesión, y lo arranca;
-4. la primera vez abre el asistente de cuentas.
+## Diferencias en macOS
 
 Es el mismo binario Rust + GTK4 con Cairo por CPU, así que gasta lo mismo
-que en Linux. Diferencias:
+que en Linux. Diferencias con Linux:
 
 | | Linux (Hyprland) | macOS |
 | --- | --- | --- |
@@ -166,29 +237,8 @@ Notas:
 - Para compilar a mano: `brew install gtk4 mpv pkgconf` y
   `cargo build --release`. `build.rs` agrega la carpeta de `libmpv` de
   Homebrew al enlazador.
-- Desinstalar: `launchctl bootout gui/$(id -u)/dev.marmota.music`, y borrar
-  la app, el plist y `$(brew --prefix)/bin/marmota-music`.
 
-## Windows
-
-```powershell
-git clone https://github.com/JorgeBelmarEscalona/marmota-music
-cd marmota-music
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
-
-El instalador:
-
-1. instala [MSYS2](https://www.msys2.org) con `winget` si no está, y desde
-   ahí GTK4, libmpv y Rust (entorno UCRT64); `yt-dlp` también con `winget`;
-2. compila y deja el programa, con las DLL de GTK y mpv que necesita, en
-   `%LOCALAPPDATA%\Programs\MarmotaMusic\bin\marmota-music.exe` (agregado al
-   `PATH` del usuario);
-3. crea el arranque automático (carpeta *Inicio*) y un acceso en el menú
-   Inicio;
-4. arranca el notch y, la primera vez, abre el asistente de cuentas.
-
-Diferencias con Linux:
+## Diferencias en Windows
 
 | | Linux (Hyprland) | Windows |
 | --- | --- | --- |
